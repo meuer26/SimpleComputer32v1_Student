@@ -1,5 +1,5 @@
 --------------------------------------------------------------------------------
--- MMU -- scaled x86 paging (single-level page table + TLB)
+-- MMU -- scaled x86 paging (two-level page directory + page table + TLB)
 --
 -- Sits between the CPU and physical RAM and translates the CPU's *virtual*
 -- addresses to *physical* ones, exactly like x86 paging, scaled to the 512 B
@@ -7,23 +7,23 @@
 --   - 64-byte pages  (offset = VA[5:0]) -- x86's 4 KB page, scaled.
 --   - VA = 10 bits (1 KB, 16 virtual pages); PA = 9 bits (512 B, 8 frames), so
 --     the virtual space is larger than physical -> demand paging is possible.
---   - Single-level page table based at CR3 (x86 uses a 2-level directory/table;
---     one level is the faithful simplification for 16 entries). PTE index = VPN.
---   - 4-byte PTEs, x86-style: bit 0 = Present, and the page's physical base is
---     the PTE with its low offset bits cleared -- so, exactly as on x86,
+--   - TWO-LEVEL page table, exactly like real x86: VA[9:8] = page-directory
+--     index (PDI), VA[7:6] = page-table index (PTI). CR3 is the page-directory
+--     base; PDE[PDI] gives a page-table base; PTE[PTI] gives the page frame.
 --         PA = (PTE & ~0x3F) | (VA & 0x3F).
---     (R/W, A, D flag bits are defined by convention but not enforced/updated in
---     hardware here -- the faithful-but-simple choice.)
+--   - 4-byte entries, x86-style: bit 0 = Present, base = entry with its low
+--     offset bits cleared. (R/W, A, D flag bits are defined by convention but
+--     not enforced/updated in hardware here -- the faithful-but-simple choice.)
 --   - A 4-entry, fully-associative TLB (round-robin refill). A TLB miss triggers
---     a real hardware page-table walk (one physical read of the PTE), visible on
---     the bus. Writing CR3 flushes the TLB (tlb_flush), as on x86.
---   - A not-present PTE raises a page fault (page_fault + fault_addr) that the
---     CPU delivers as #PF (vector 14) through the existing interrupt path.
+--     a real hardware walk of TWO physical reads (the PDE then the PTE), both
+--     visible on the bus. Writing CR3 flushes the TLB (tlb_flush), as on x86.
+--   - A not-present PDE *or* PTE raises a page fault (page_fault + fault_addr)
+--     that the CPU delivers as #PF (vector 14) through the interrupt path.
 --
 -- With paging disabled (CR0.PG = 0) the MMU is transparent: PA = VA, single
 -- cycle -- so every non-paging program behaves exactly as before.
 --
--- RAM reads are combinational, so a walk is a single extra (stall) cycle.
+-- RAM reads are combinational, so a walk costs two extra (stall) cycles.
 --------------------------------------------------------------------------------
 
 library IEEE;
@@ -99,12 +99,20 @@ architecture behavioral of mmu is
     signal tlb_way  : integer range 0 to TLB_N - 1;
     signal phys     : unsigned(31 downto 0);                     -- translated PA on a hit
 
+    -- Two-level walk: the VPN splits into a page-directory index (high bits) and
+    -- a page-table index (low bits) -- x86's page directory -> page table -> page.
+    constant PTI_BITS : integer := 2;                        -- page-table index bits
+    constant PDI_BITS : integer := VPN_BITS - PTI_BITS;      -- directory index bits
+
     -- controller
-    type mstate_t is (M_IDLE, M_WALK);
+    type mstate_t is (M_IDLE, M_WALK_PDE, M_WALK_PTE);
     signal mstate : mstate_t := M_IDLE;
 
-    -- PTE physical address for the current VPN
-    signal pte_addr : unsigned(31 downto 0);
+    signal pdi      : unsigned(PDI_BITS - 1 downto 0);       -- directory index
+    signal pti      : unsigned(PTI_BITS - 1 downto 0);       -- page-table index
+    signal pde_addr : unsigned(31 downto 0);                 -- CR3 + PDI*4
+    signal pt_base  : unsigned(31 downto 0) := (others => '0'); -- page-table base (from PDE)
+    signal pte_addr : unsigned(31 downto 0);                 -- pt_base + PTI*4
 
     signal trans_reg : unsigned(31 downto 0) := (others => '0');
     signal walk_reg  : unsigned(31 downto 0) := (others => '0');
@@ -117,9 +125,13 @@ begin
     ----------------------------------------------------------------------------
     offset <= unsigned(cpu_addr(OFF_BITS - 1 downto 0));
     vpn    <= unsigned(cpu_addr(OFF_BITS + VPN_BITS - 1 downto OFF_BITS));
+    pdi    <= unsigned(cpu_addr(OFF_BITS + VPN_BITS - 1 downto OFF_BITS + PTI_BITS));
+    pti    <= unsigned(cpu_addr(OFF_BITS + PTI_BITS - 1 downto OFF_BITS));
 
-    -- PTE address = CR3 + VPN*4  (single-level table indexed by VPN)
-    pte_addr <= unsigned(cr3) + resize(vpn & "00", 32);
+    -- Two-level walk addresses: PDE = CR3 + PDI*4, then PTE = (PDE's page-table
+    -- base) + PTI*4.  pt_base is latched from the PDE between the two reads.
+    pde_addr <= unsigned(cr3) + resize(pdi & "00", 32);
+    pte_addr <= pt_base + resize(pti & "00", 32);
 
     tlb_lookup : process(vpn, tlb_valid, tlb_vpn)
         variable h : std_logic;
@@ -144,7 +156,8 @@ begin
     -- Bus + handshake (combinational)
     ----------------------------------------------------------------------------
     bus_proc : process(pg_enable, mstate, cpu_addr, cpu_din, cpu_we, cpu_be,
-                       cpu_req, cpu_ifetch, mem_din, mem_ready, phys, pte_addr, tlb_hit)
+                       cpu_req, cpu_ifetch, mem_din, mem_ready, phys,
+                       pde_addr, pte_addr, tlb_hit)
     begin
         -- defaults
         mem_addr   <= cpu_addr;
@@ -177,10 +190,20 @@ begin
                         -- TLB miss: stall; the page-table walk starts next cycle
                         cpu_ready <= '0';
                     end if;
-                when M_WALK =>
-                    -- Read the PTE through the cache (it is data: ifetch=0). Wait
-                    -- for the cache (mem_ready) before trusting mem_din. A not-
-                    -- present PTE raises #PF once the read has actually returned.
+                when M_WALK_PDE =>
+                    -- First read: the page-directory entry (data, ifetch=0). A not-
+                    -- present PDE raises #PF once the read has actually returned.
+                    mem_addr   <= std_logic_vector(pde_addr);
+                    mem_we     <= '0';
+                    mem_req    <= '1';
+                    mem_ifetch <= '0';
+                    cpu_ready  <= '0';
+                    if mem_ready = '1' and mem_din(0) = '0' then
+                        page_fault <= '1';
+                    end if;
+                when M_WALK_PTE =>
+                    -- Second read: the page-table entry in the PDE's page table.
+                    -- A not-present PTE raises #PF (demand paging).
                     mem_addr   <= std_logic_vector(pte_addr);
                     mem_we     <= '0';
                     mem_req    <= '1';
@@ -221,21 +244,31 @@ begin
                                 trans_reg <= trans_reg + 1;
                             end if;
                         elsif cpu_req = '1' then
-                            mstate <= M_WALK;                -- begin the page-table walk
+                            mstate <= M_WALK_PDE;            -- begin the 2-level walk
                         end if;
 
-                    when M_WALK =>
-                        -- Wait until the cache has returned the PTE.
+                    when M_WALK_PDE =>                        -- directory-entry read
                         if mem_ready = '1' then
-                            if mem_din(0) = '1' then         -- Present: refill TLB
+                            if mem_din(0) = '1' then         -- PDE present: read the PTE next
+                                pt_base <= unsigned(mem_din) and not OFF_MASK;
+                                mstate  <= M_WALK_PTE;
+                            else                             -- PDE not present: #PF
+                                fault_reg <= fault_reg + 1;
+                                mstate    <= M_IDLE;
+                            end if;
+                        end if;
+
+                    when M_WALK_PTE =>                        -- page-table-entry read
+                        if mem_ready = '1' then
+                            if mem_din(0) = '1' then         -- PTE present: refill TLB
                                 tlb_valid(fill_ptr) <= '1';
                                 tlb_vpn(fill_ptr)   <= vpn;
                                 tlb_base(fill_ptr)  <= unsigned(mem_din) and not OFF_MASK;
                                 if fill_ptr = TLB_N - 1 then fill_ptr <= 0;
                                 else fill_ptr <= fill_ptr + 1; end if;
-                                walk_reg <= walk_reg + 1;
+                                walk_reg <= walk_reg + 1;    -- one logical walk (= 2 reads)
                                 mstate   <= M_IDLE;          -- retry -> now a TLB hit
-                            else                             -- not present: deliver #PF
+                            else                             -- PTE not present: #PF
                                 fault_reg <= fault_reg + 1;
                                 mstate    <= M_IDLE;
                             end if;

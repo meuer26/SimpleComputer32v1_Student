@@ -1,32 +1,33 @@
-; Test 25: virtual memory -- identity paging.
-;   Build a single-level page table (paging still OFF, so these writes are
-;   physical), map virtual pages 0..2 to the identical physical frames, load
-;   CR3, then set CR0.PG to turn paging ON. From that point every address the
-;   CPU emits is virtual and the MMU translates it through the page table (a TLB
-;   miss walks the table; hits are single-cycle). With an identity map VA == PA,
-;   so the store below lands at the same physical address -- proving the
-;   translation path works end to end.
+; Test 25: virtual memory -- identity paging (TWO-LEVEL page tables).
+;   Build an x86-style two-level table (paging still OFF, so these writes are
+;   physical): a page DIRECTORY at 0x100 whose entry 0 points to a page TABLE
+;   (PT0) at 0x180; PT0 identity-maps virtual pages 0..2 to the same physical
+;   frames. Load CR3 (= directory base) and set CR0.PG. From then on every
+;   address is virtual: a TLB miss walks TWO levels (read the PDE, then the PTE
+;   -- two bus reads); hits translate in one cycle. With an identity map VA==PA,
+;   so the store below lands at the same physical address.
 ;
-;   64-byte pages: PTE = (frame << 6) | present.  Page table base (CR3) = 0x100.
-;     PTE[0]=0x01 (frame0), PTE[1]=0x41 (frame1), PTE[2]=0x81 (frame2)
+;   64-byte pages. VA[9:8]=dir index, VA[7:6]=table index, VA[5:0]=offset.
+;   Entry = (frame<<6) | present.  Directory @ 0x100, PT0 @ 0x180.
 ; Expected: eax=0xDEADBEEF ebx=0xDEADBEEF ; phys mem 0x80 = EF BE AD DE
 bits 32
-    ; --- build the page table at physical 0x100 (paging OFF) ---
+    ; --- page directory @ 0x100 ---
+    mov eax, 0x181
+    mov [0x100], eax        ; PDE[0] -> page table PT0 at PA 0x180, present
+    ; --- page table PT0 @ 0x180: identity-map VPN0..2 ---
     mov eax, 0x01
-    mov [0x100], eax        ; PTE[0]: VPN0 -> frame0, present
+    mov [0x180], eax        ; PT0[0]: VPN0 -> frame0 (code), present
     mov eax, 0x41
-    mov [0x104], eax        ; PTE[1]: VPN1 -> frame1, present
+    mov [0x184], eax        ; PT0[1]: VPN1 -> frame1 (code), present
     mov eax, 0x81
-    mov [0x108], eax        ; PTE[2]: VPN2 -> frame2, present
+    mov [0x188], eax        ; PT0[2]: VPN2 -> frame2 (data), present
 
-    ; --- turn paging on ---
     mov eax, 0x100
-    mov cr3, eax            ; CR3 = page-table base
+    mov cr3, eax            ; CR3 = page-DIRECTORY base
     mov eax, 0x80000000
-    mov cr0, eax            ; CR0.PG = 1  -> paging ON
+    mov cr0, eax            ; CR0.PG = 1 -> paging ON (two-level walks from here)
 
-    ; --- now virtual; identity map means VA 0x80 -> PA 0x80 ---
     mov eax, 0xDEADBEEF
-    mov [0x80], eax         ; store through the MMU
+    mov [0x80], eax         ; VA 0x80 -> PDE[0] -> PT0[2] -> PA 0x80 (identity)
     mov ebx, [0x80]         ; read it back
     hlt

@@ -5,7 +5,7 @@ An x86-32 (IA-32) machine in VHDL that runs **real x86 machine code**: programs 
 - **Superscalar P5 core** — U and V integer pipes issue two instructions per clock, a 2-bit branch-target buffer predicts at decode with speculative fetch, over a five-stage pipe (PF D1 D2 EX WB).
 - **Split write-back L1** — separate 2-way, 32-byte-line instruction and data caches; self-/cross-modifying code stays coherent by snooping the I-cache.
 - **Dual-core P54C SMP** — snooping **MESI** keeps the data caches coherent, a sticky `LOCK#` makes `LOCK CMPXCHG` atomic, and the application core is started the real way (local-APIC **INIT + STARTUP IPI**).
-- **Scaled paging** — each core has its own MMU + TLB (single-level page table, `#PF`); the physically-tagged L1 translates, then caches.
+- **Scaled paging** — each core has its own MMU + TLB with a real x86 **two-level** walk (page directory → page table → page, two memory reads per TLB miss, `#PF` at either level); the physically-tagged L1 translates, then caches.
 - **Teaching PC** — real 8259 PICs, an 8042 keyboard, a VGA text screen, and an ATA disk, wired to your terminal as a live screen and keyboard.
 - **gcc-ready integer ISA** — real encodings including SIB scaled-index addressing, memory-operand and byte ALU, `IMUL`/`MUL`/`DIV`/`IDIV` (multi-cycle), shifts, `LEA`, `MOVSX`/`MOVZX`, `SETcc`, `IN`/`OUT`, SSE2 `MOVAPS`/`PADDD`; anything unimplemented raises `#UD`.
 - **Live CPI report** (press `r`) — measured instructions, CPI, stall breakdown by cause, U/V pairs, BTB accuracy, cache hit rates, and data AMAT, all read from the core's own hardware counters.

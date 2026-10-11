@@ -1379,6 +1379,15 @@ def cpi_view(scr, sh, build, snap):
                        f"({sy['dc_hits']:,} hits / {sy['dc_miss']:,} miss)"); y += 1
         put(scr, y, 1, f"AMAT (data)            {amat:5.2f} cyc  "
                        f"(hit 1 + miss-rate {dmiss_r:.1f}% x penalty {penalty:.1f} cyc)"); y += 1
+        # TLB / paging (only meaningful once a program turns paging on). A miss
+        # walks the two-level table = two memory reads (PDE then PTE).
+        tlb_acc = sy["trans"] + sy["walks"]
+        if tlb_acc:
+            put(scr, y, 1, f"TLB hit rate           {pct(sy['trans'], tlb_acc):5.1f}%     "
+                           f"({sy['trans']:,} hits / {sy['walks']:,} walks x2 reads / "
+                           f"{sy['faults']:,} #PF)"); y += 1
+        else:
+            put(scr, y, 1, "TLB / paging             off     (CR0.PG = 0)"); y += 1
 
         y += 1
         put(scr, y, 1, "where the active cycles go (measured stall breakdown):", G); y += 1
