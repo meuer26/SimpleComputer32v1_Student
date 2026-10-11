@@ -152,6 +152,11 @@ if [ "$PC" = "1" ]; then
     [ -n "$PC_DISK" ]     && PC_ARGS+=(-gdisk_file="$PC_DISK")
     [ -n "$PC_DISK_OUT" ] && PC_ARGS+=(-gdisk_out="$PC_DISK_OUT")
     [ -n "$PC_KEYS" ]     && PC_ARGS+=(-gkeys_file="$PC_KEYS")
+    # Machine-configuration knobs: any CFG_* that is set in the environment
+    # overrides the tb_pc default (the standard Pentium machine). Unset = default.
+    for v in CFG_DUAL CFG_SERIAL CFG_BTB CFG_CACHE CFG_SETS CFG_WAYS CFG_LINE; do
+        val="${!v:-}"; [ -n "$val" ] && PC_ARGS+=(-g"$v"="$val")
+    done
     if [ "$PC_LIVE" = "1" ]; then
         # Interactive: the terminal belongs to the screen; simulator chatter
         # goes to a log. No waveform (a live session can run for minutes) --

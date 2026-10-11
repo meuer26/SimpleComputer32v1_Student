@@ -198,6 +198,34 @@ EXPECTED = {
     # pair forwards the flags (the 0xDEAD / 0xBAD stores never happen).
     34: {'regs': {'eax': 0x29, 'ebx': 0x2A, 'ecx': 0x37, 'edx': 0x2C},
          'mem': [(0x100, [0x37, 0, 0, 0]), (0x104, [0x29, 0, 0, 0])]},
+    # SIB / scaled-index addressing: every form read back equals the stored value.
+    35: {'regs': {'eax': 0x11223344, 'ebx': 0x11223344, 'ecx': 0x11223344,
+                  'edx': 0x11223344, 'esp': 0x1F0},
+         'mem': [(0x100, [0x44, 0x33, 0x22, 0x11]), (0x48, [0x44, 0x33, 0x22, 0x11])]},
+    # ALU with a memory operand (load direction) + CMP-with-memory feeding a branch.
+    36: {'regs': {'eax': 0, 'ebx': 0xFF, 'ecx': 50, 'edx': 0, 'z': 1},
+         'mem': [(0x100, [0xFF, 0, 0, 0])]},
+    # Read-modify-write ALU on memory ([m] op= r) and grp1 ([m] op= imm).
+    37: {'regs': {'eax': 0x7B, 'ebx': 0x17, 'ecx': 0x9B, 'edx': 0x22},
+         'mem': [(0x90, [0x9B, 0, 0, 0]), (0x94, [0x22, 0, 0, 0])]},
+    # IMUL (2-/3-operand, memory) and the shift group by imm8/CL + shift-on-memory.
+    38: {'regs': {'eax': 0x28, 'ebx': 0x3F4, 'ecx': 0x100, 'edx': 0xFFFFFFF0},
+         'mem': [(0x80, [10, 0, 0, 0]), (0x84, [0x28, 0, 0, 0])]},
+    # LEA, INC/DEC on a memory counter (grp5), and LEAVE -- the gcc "glue".
+    39: {'regs': {'eax': 0x54, 'ebx': 0x90, 'ecx': 0x65, 'edx': 0xABCD, 'esp': 0x1F0},
+         'mem': [(0x100, [0x65, 0, 0, 0])]},
+    # grp3 (MUL/DIV/IDIV/NEG), MOVSX, SETcc, CDQ -- division + sign-extend + bool.
+    47: {'regs': {'eax': 0xFFFFFFFA, 'ebx': 0xFFFFFFF0, 'ecx': 1, 'edx': 0xFFFFFFFE},
+         'mem': [(0x100, [0x2A, 0, 0, 0]), (0x104, [0x0E, 0, 0, 0]),
+                 (0x108, [2, 0, 0, 0]), (0x10C, [0xFB, 0xFF, 0xFF, 0xFF])]},
+    # byte r/m ALU: store/load-direction ADD..CMP, grp1 r/m8,imm8, TEST r/m8,r8,
+    # on registers and memory (RMW).  Every result converges on 0x3F.
+    48: {'regs': {'eax': 0x3F, 'ebx': 0x3F, 'ecx': 0x3F, 'edx': 0x3F},
+         'mem': [(0x100, [0x30, 0, 0, 0]), (0x104, [0x3F, 0, 0, 0]),
+                 (0x108, [1, 0, 0, 0]), (0x10C, [1, 0, 0, 0])]},
+    # Pairing demo (also `make cpi-compare PROG=asm/49_pairing.asm`): a loop of
+    # independent adds; 500 iterations * 4 per register -> 2000 (0x7D0).
+    49: {'regs': {'eax': 0x7D0, 'ebx': 0x7D0, 'ecx': 0}, 'mem': []},
     # Teaching PC (run via `make pc-test`): screen rows, RAM, disk image.
     40: {'regs': {'ebx': 0xFFFFFFFF, 'i': 0},
          'mem': [(0x800, [0x48, 0x1F, 0x65, 0x1F, 0xE9])],

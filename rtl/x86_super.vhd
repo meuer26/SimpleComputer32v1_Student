@@ -75,7 +75,15 @@ entity x86_cpu is
         -- executing only when woken by `wake` at `wake_eip` -- the Pentium SMP
         -- bring-up where the BSP starts the APs (a scaled startup IPI). The
         -- bootstrap processor leaves this false and runs from reset.
-        AP_PARK          : boolean := false
+        AP_PARK          : boolean := false;
+        -- Teaching knobs (all default to the real Pentium behaviour, so the
+        -- default machine is unchanged -- see the README). DUAL_ISSUE=false
+        -- disables U/V pairing (scalar). SERIALIZE=true drains the pipe after
+        -- every instruction (no overlap = "no pipeline"). BTB_ENABLE=false turns
+        -- off branch prediction (every taken branch mispredicts).
+        DUAL_ISSUE       : boolean := true;
+        SERIALIZE        : boolean := false;
+        BTB_ENABLE       : boolean := true
     );
     port (
         clk      : in  std_logic;
@@ -176,7 +184,13 @@ entity x86_cpu is
         -- tgt[32i+31:32i], and a meta byte {valid=bit0, ctr=bits[2:1]}.
         dbg_btb_tag  : out std_logic_vector(255 downto 0);
         dbg_btb_tgt  : out std_logic_vector(255 downto 0);
-        dbg_btb_meta : out std_logic_vector(63 downto 0)
+        dbg_btb_meta : out std_logic_vector(63 downto 0);
+        -- Performance counters for the CPI report: branches predicted correctly
+        -- vs. mispredicted (accuracy = correct/(correct+wrong)), and the running
+        -- 32-bit count of co-issued U/V pairs.  (dbg_pairs above is the low 16.)
+        dbg_btb_correct : out std_logic_vector(31 downto 0);
+        dbg_btb_wrong   : out std_logic_vector(31 downto 0);
+        dbg_pairs32     : out std_logic_vector(31 downto 0)
     );
 end x86_cpu;
 
@@ -193,9 +207,11 @@ architecture superscalar of x86_cpu is
         S_XCHG_R, S_XCHG_W,
         S_LIDT0, S_LIDT1, S_CMPX_R, S_CMPX_W, S_XMM_LD, S_XMM_ST,
         S_IN, S_OUT,
+        S_MULDIV_WAIT,              -- multi-cycle latency hold for MUL/IMUL/DIV/IDIV
         S_HALT
     );
     signal state, next_state : cpu_state_t := S_IDLE;
+    signal md_cnt : integer range 0 to 63 := 0;   -- MUL/DIV latency counter
 
     type regfile_t is array (0 to 7) of unsigned(31 downto 0);
     signal reg : regfile_t := (others => (others => '0'));
@@ -272,8 +288,30 @@ architecture superscalar of x86_cpu is
     begin
         case op is
             when x"89" | x"8B" | x"88" | x"8A" | x"C6" | x"C7" |
-                 x"01" | x"03" | x"29" | x"39" | x"21" | x"09" | x"31" | x"85" |
-                 x"87" | x"D1" | x"81" | x"83" => return true;
+                 x"01" | x"03" | x"09" | x"0B" | x"11" | x"13" | x"19" | x"1B" |
+                 x"21" | x"23" | x"29" | x"2B" | x"31" | x"33" | x"39" | x"3B" |
+                 x"85" | x"87" | x"D1" | x"81" | x"83" |
+                 x"69" | x"6B" |                                 -- IMUL r,r/m,imm
+                 x"C0" | x"C1" | x"D0" | x"D2" | x"D3" => return true;  -- shift/rotate
+            when x"8D" => return true;                           -- LEA
+            when x"F7" | x"F6" => return true;                   -- grp3 (TEST/NOT/NEG/MUL/IMUL)
+            when x"FF" | x"FE" => return true;                   -- grp5/grp4 (INC/DEC r/m, ...)
+            when x"00" | x"02" | x"08" | x"0A" | x"10" | x"12" | x"18" | x"1A" |
+                 x"20" | x"22" | x"28" | x"2A" | x"30" | x"32" | x"38" | x"3A" |
+                 x"80" | x"84" => return true;                   -- byte ALU / grp1 r/m8 / TEST r/m8
+            when others => return false;
+        end case;
+    end function;
+
+    -- The byte (8-bit operand) ALU opcodes ADD..CMP, both directions: op =
+    -- 0x00 + (aluop<<3) + (dir<<1), with the size bit (bit 0) clear. dir (bit 1):
+    -- 0 = r/m8 <- r/m8 op r8 (store direction), 1 = r8 <- r8 op r/m8 (load).
+    function is_alu8(op : std_logic_vector(7 downto 0)) return boolean is
+    begin
+        case op is
+            when x"00" | x"02" | x"08" | x"0A" | x"10" | x"12" | x"18" | x"1A" |
+                 x"20" | x"22" | x"28" | x"2A" | x"30" | x"32" | x"38" | x"3A" =>
+                return true;
             when others => return false;
         end case;
     end function;
@@ -302,14 +340,22 @@ architecture superscalar of x86_cpu is
 
     -- Immediate bytes that follow the ModR/M (+disp) of a group opcode.
     function imm_len_grp(op : std_logic_vector(7 downto 0); is0f : std_logic;
-                         p66 : std_logic) return integer is
+                         p66 : std_logic; m : std_logic_vector(7 downto 0)) return integer is
     begin
         if is0f = '1' then return 0; end if;
         case op is
             when x"81" => return 4;
             when x"83" => return 1;
+            when x"80" => return 1;                                           -- grp1 byte [m],imm8
             when x"C6" => return 1;
             when x"C7" => if p66 = '1' then return 2; else return 4; end if;
+            when x"69" => if p66 = '1' then return 2; else return 4; end if;  -- IMUL r,r/m,imm32
+            when x"6B" => return 1;                                           -- IMUL r,r/m,imm8
+            when x"C0" | x"C1" => return 1;                                   -- shift r/m, imm8
+            when x"F7" =>                                                     -- grp3: only TEST has imm
+                if m(5 downto 3) = "000" or m(5 downto 3) = "001" then return 4; else return 0; end if;
+            when x"F6" =>
+                if m(5 downto 3) = "000" or m(5 downto 3) = "001" then return 1; else return 0; end if;
             when others => return 0;
         end case;
     end function;
@@ -319,6 +365,26 @@ architecture superscalar of x86_cpu is
         if m(7 downto 6) = "00" and m(2 downto 0) = "101" then return 4;
         elsif m(7 downto 6) = "01" then return 1;
         elsif m(7 downto 6) = "10" then return 4;
+        else return 0; end if;
+    end function;
+
+    -- A SIB byte follows the ModR/M when it is a memory form with rm = 100.
+    function has_sib(m : std_logic_vector(7 downto 0)) return boolean is
+    begin
+        return m(7 downto 6) /= "11" and m(2 downto 0) = "100";
+    end function;
+
+    -- Displacement length, SIB-aware: a SIB with mod=00 and base=101 carries a
+    -- disp32 (the no-base, index-only form) instead of the plain rm=101 case.
+    function disp_len_s(m, sib : std_logic_vector(7 downto 0)) return integer is
+    begin
+        if m(7 downto 6) = "01" then return 1;
+        elsif m(7 downto 6) = "10" then return 4;
+        elsif m(7 downto 6) = "00" then
+            if has_sib(m) then
+                if sib(2 downto 0) = "101" then return 4; else return 0; end if;
+            elsif m(2 downto 0) = "101" then return 4;
+            else return 0; end if;
         else return 0; end if;
     end function;
 
@@ -354,20 +420,24 @@ architecture superscalar of x86_cpu is
         rg    := m(5 downto 3);
         if is0f = '1' then
             case op is
+                when x"1F" => return true;                           -- multi-byte NOP (0F 1F /0)
                 when x"01" => return rg = "011" and abs32;          -- LIDT [disp32]
                 when x"B1" => return abs32;                          -- CMPXCHG [disp32],r32
-                when x"B6" => return not sib;                        -- MOVZX r32,r/m8
+                when x"B6" | x"B7" => return true;                   -- MOVZX r32, r/m8 / r/m16
+                when x"BE" | x"BF" => return true;                   -- MOVSX r32, r/m8 / r/m16
+                when x"AF" => return true;                           -- IMUL r32, r/m32
                 when x"20" | x"22" =>                                -- MOV r32<->CR0/2/3
                     return (not memf) and (rg = "000" or rg = "010" or rg = "011");
                 when x"28" | x"29" | x"6E" | x"6F" | x"7E" | x"7F" | x"FE" | x"EF" =>
                     return (not memf) or abs32;                      -- SSE reg or [disp32]
-                when others => return op(7 downto 4) = x"8";         -- Jcc rel32
+                when others => return op(7 downto 4) = x"8" or op(7 downto 4) = x"9";  -- Jcc / SETcc
             end case;
         end if;
         if p66 = '1' then                -- 16-bit operand size: only these forms
             case to_integer(unsigned(op)) is
                 when 16#B8# to 16#BF# | 16#89# | 16#8B# | 16#C7# | 16#A1# | 16#A3# |
-                     16#E5# | 16#E7# | 16#ED# | 16#EF# => null;
+                     16#E5# | 16#E7# | 16#ED# | 16#EF# |
+                     16#90# => null;    -- 66 90 = xchg ax,ax, gcc's 2-byte NOP pad
                 when others => return false;
             end case;
         end if;
@@ -380,14 +450,23 @@ architecture superscalar of x86_cpu is
                  16#CD# | 16#A0# to 16#A3# |
                  16#05# | 16#0D# | 16#25# | 16#2D# | 16#35# | 16#3D# |
                  16#04# | 16#0C# | 16#24# | 16#2C# | 16#34# | 16#3C# | 16#A8# => return true;
-            when 16#88# | 16#89# | 16#8A# | 16#8B# => return not sib;
-            when 16#C6# | 16#C7# => return rg = "000" and not sib;
-            when 16#01# | 16#03# | 16#09# | 16#21# | 16#29# | 16#31# | 16#39# |
-                 16#85# | 16#81# | 16#83# => return not memf;      -- register forms
-            when 16#D1# =>
-                return (not memf) and (rg = "000" or rg = "001" or rg = "100" or
-                                       rg = "101" or rg = "111");
+            when 16#88# | 16#89# | 16#8A# | 16#8B# => return true;   -- MOV r/m<->r (reg/mem/SIB)
+            when 16#C6# | 16#C7# => return rg = "000";              -- MOV r/m, imm (reg/mem/SIB)
+            when 16#01# | 16#03# | 16#09# | 16#0B# | 16#11# | 16#13# | 16#19# | 16#1B# |
+                 16#21# | 16#23# | 16#29# | 16#2B# | 16#31# | 16#33# | 16#39# | 16#3B# |
+                 16#85# | 16#81# | 16#83# => return true;      -- ALU reg + memory (incl SIB)
+            when 16#69# | 16#6B# => return true;                    -- IMUL r32,r/m32,imm
+            when 16#C1# | 16#D1# | 16#D3# =>                         -- shift/rotate r/m32
+                return rg = "000" or rg = "001" or rg = "100" or rg = "101" or rg = "111";
+            when 16#8D# => return memf;                             -- LEA r32, m (memory form)
+            when 16#C9# => return true;                             -- LEAVE
+            when 16#FF# => return rg = "000" or rg = "001";         -- INC/DEC r/m32
+            when 16#98# | 16#99# => return true;                    -- CWDE / CDQ
+            when 16#F7# => return true;                             -- grp3: TEST/NOT/NEG/MUL/IMUL/DIV/IDIV
             when 16#87# => return abs32 and rg = "000";              -- XCHG [disp32],EAX
+            when 16#00# | 16#02# | 16#08# | 16#0A# | 16#10# | 16#12# | 16#18# | 16#1A# |
+                 16#20# | 16#22# | 16#28# | 16#2A# | 16#30# | 16#32# | 16#38# | 16#3A# |
+                 16#80# | 16#84# => return true;    -- byte ALU reg/mem (incl SIB), grp1 r/m8, TEST
             when others => return false;
         end case;
     end function;
@@ -448,11 +527,33 @@ architecture superscalar of x86_cpu is
     --   mod=00        -> [reg]
     --   mod=01        -> [reg + disp8] (sign-extended)   e.g. [EBP+8] frames
     --   mod=10        -> [reg + disp32]
-    function ea_of(m : std_logic_vector(7 downto 0); opd : std_logic_vector(31 downto 0);
+    function ea_of(m, sib : std_logic_vector(7 downto 0); opd : std_logic_vector(31 downto 0);
                    rf : regfile_t) return std_logic_vector is
-        variable rm : integer;
+        variable rm, bas, idx, scl : integer;
+        variable base_v, index_v, disp_v : unsigned(31 downto 0);
     begin
         rm := to_integer(unsigned(m(2 downto 0)));
+        if has_sib(m) then                            -- [base + index*scale + disp]
+            bas := to_integer(unsigned(sib(2 downto 0)));
+            idx := to_integer(unsigned(sib(5 downto 3)));
+            scl := to_integer(unsigned(sib(7 downto 6)));
+            if m(7 downto 6) = "00" and sib(2 downto 0) = "101" then
+                base_v := (others => '0');            -- no base (disp32 + index)
+            else
+                base_v := rf(bas);
+            end if;
+            if sib(5 downto 3) = "100" then
+                index_v := (others => '0');           -- no index (esp cannot be an index)
+            else
+                index_v := shift_left(rf(idx), scl);
+            end if;
+            if m(7 downto 6) = "01" then disp_v := sext8(opd);
+            elsif m(7 downto 6) = "10" then disp_v := unsigned(opd);
+            elsif m(7 downto 6) = "00" and sib(2 downto 0) = "101" then disp_v := unsigned(opd);
+            else disp_v := (others => '0');
+            end if;
+            return std_logic_vector(base_v + index_v + disp_v);
+        end if;
         if m(7 downto 6) = "00" and m(2 downto 0) = "101" then
             return opd;
         elsif m(7 downto 6) = "00" then
@@ -597,11 +698,13 @@ architecture superscalar of x86_cpu is
         regf := m(7 downto 6) = "11";
         if is0f = '1' then
             case op is
-                when x"B6" => r(rgi) := '1';                  -- MOVZX
+                when x"B6" | x"B7" | x"BE" | x"BF" => r(rgi) := '1';  -- MOVZX / MOVSX
+                when x"AF" => r(rgi) := '1';                  -- IMUL r32, r/m32
                 when x"20" => r(rmi) := '1';                  -- MOV r32, CRn
                 when x"B1" => r(0) := '1';                    -- CMPXCHG may load EAX
                 when x"7E" => if regf then r(rmi) := '1'; end if;
-                when others => null;
+                when others =>
+                    if op(7 downto 4) = x"9" and regf then r(rmi mod 4) := '1'; end if;  -- SETcc r/m8
             end case;
             return r;
         end if;
@@ -615,20 +718,45 @@ architecture superscalar of x86_cpu is
             when 16#88# | 16#C6# => if regf then r(rmi mod 4) := '1'; end if;
             when 16#89# | 16#C7# => if regf then r(rmi) := '1'; end if;
             when 16#8A# => r(rgi mod 4) := '1';
-            when 16#8B# | 16#03# => r(rgi) := '1';
-            when 16#01# | 16#29# | 16#21# | 16#09# | 16#31# | 16#D1# => r(rmi) := '1';
-            when 16#81# | 16#83# => if m(5 downto 3) /= "111" then r(rmi) := '1'; end if;
+            -- load-direction ALU (r <- r op r/m) and MOV r,r/m write the reg operand
+            when 16#8B# | 16#03# | 16#0B# | 16#13# | 16#1B# | 16#23# | 16#2B# | 16#33# |
+                 16#69# | 16#6B# | 16#8D# =>                     -- + IMUL r,r/m,imm; LEA
+                r(rgi) := '1';
+            when 16#C9# => r(4) := '1'; r(5) := '1';            -- LEAVE writes ESP, EBP
+            -- store-direction ALU: the register form writes r/m; the memory form
+            -- writes memory (no register), so only mark a reg when regf.
+            when 16#01# | 16#09# | 16#11# | 16#19# | 16#21# | 16#29# | 16#31# =>
+                if regf then r(rmi) := '1'; end if;
+            when 16#C0# | 16#C1# | 16#D0# | 16#D1# | 16#D2# | 16#D3# | 16#FF# =>  -- shift/INC/DEC r/m
+                if regf then r(rmi) := '1'; end if;
+            when 16#81# | 16#83# => if regf and m(5 downto 3) /= "111" then r(rmi) := '1'; end if;
+            when 16#F7# =>                                   -- grp3
+                case m(5 downto 3) is
+                    when "010" | "011" => if regf then r(rmi) := '1'; end if;  -- NOT/NEG write r/m
+                    when "100" | "101" | "110" | "111" => r(0) := '1'; r(2) := '1';  -- MUL/DIV -> EDX:EAX
+                    when others => null;                                       -- TEST: flags only
+                end case;
+            when 16#98# => r(0) := '1';                      -- CWDE writes EAX
+            when 16#99# => r(2) := '1';                      -- CDQ writes EDX
             when 16#05# | 16#2D# | 16#25# | 16#0D# | 16#35# | 16#04# | 16#0C# |
                  16#24# | 16#2C# | 16#34# | 16#A0# | 16#A1# | 16#D7# |
                  16#E4# | 16#E5# | 16#EC# | 16#ED# | 16#87# => r(0) := '1';
-            when others => null;
+            -- byte ALU writes an 8-bit register: r8 index i touches physical
+            -- register (i mod 4) -- AL/AH share EAX, etc. (same as MOV r8 above).
+            when 16#02# | 16#0A# | 16#12# | 16#1A# | 16#22# | 16#2A# | 16#32# =>
+                r(rgi mod 4) := '1';                             -- load-dir (not CMP 3A)
+            when 16#00# | 16#08# | 16#10# | 16#18# | 16#20# | 16#28# | 16#30# =>
+                if regf then r(rmi mod 4) := '1'; end if;        -- store-dir (not CMP 38)
+            when 16#80# =>
+                if regf and m(5 downto 3) /= "111" then r(rmi mod 4) := '1'; end if;  -- grp1 r/m8 (not CMP)
+            when others => null;                                 -- 38/3A CMP, 84 TEST: flags only
         end case;
         return r;
     end function;
 
     -- Registers an instruction needs in D2 for ADDRESS GENERATION.
     function use_mask(op : std_logic_vector(7 downto 0); is0f : std_logic;
-                      m : std_logic_vector(7 downto 0)) return std_logic_vector is
+                      m, sib : std_logic_vector(7 downto 0)) return std_logic_vector is
         variable r : std_logic_vector(7 downto 0) := (others => '0');
         variable has : boolean;
     begin
@@ -637,10 +765,61 @@ architecture superscalar of x86_cpu is
             return r;
         end if;
         has := (is0f = '1' and op(7 downto 4) /= x"8") or (is0f = '0' and has_modrm(op));
-        if has and m(7 downto 6) /= "11" and not (m(7 downto 6) = "00" and m(2 downto 0) = "101") then
-            r(to_integer(unsigned(m(2 downto 0)))) := '1';    -- the base register
+        if has and m(7 downto 6) /= "11" then
+            if has_sib(m) then                                -- SIB: base + index
+                if not (m(7 downto 6) = "00" and sib(2 downto 0) = "101") then
+                    r(to_integer(unsigned(sib(2 downto 0)))) := '1';
+                end if;
+                if sib(5 downto 3) /= "100" then
+                    r(to_integer(unsigned(sib(5 downto 3)))) := '1';
+                end if;
+            elsif not (m(7 downto 6) = "00" and m(2 downto 0) = "101") then
+                r(to_integer(unsigned(m(2 downto 0)))) := '1';  -- the base register
+            end if;
         end if;
         return r;
+    end function;
+
+    -- A memory-form ALU op whose result is written BACK to memory (so it needs
+    -- a store after the load): the store-direction ADD..XOR and grp1 (not CMP,
+    -- which is flags-only, nor TEST, nor the load-direction forms r <- r op [m]).
+    function mem_alu_wb(op, m : std_logic_vector(7 downto 0)) return boolean is
+    begin
+        if m(7 downto 6) = "11" then return false; end if;
+        case op is
+            when x"01" | x"09" | x"11" | x"19" | x"21" | x"29" | x"31" => return true;
+            -- byte store-direction ALU (r/m8 <- r/m8 op r8), ADD..XOR but not CMP/TEST
+            when x"00" | x"08" | x"10" | x"18" | x"20" | x"28" | x"30" => return true;
+            when x"81" | x"83" | x"80" => return m(5 downto 3) /= "111";  -- grp1 except CMP
+            when x"C1" | x"D1" | x"D3" => return true;                 -- shift r/m, * (RMW)
+            when x"FF" => return m(5 downto 3) = "000" or m(5 downto 3) = "001";  -- INC/DEC r/m
+            when x"F7" => return m(5 downto 3) = "010" or m(5 downto 3) = "011";  -- NOT/NEG r/m
+            when others => return false;
+        end case;
+    end function;
+
+    -- Extra EX cycles a multiply/divide stalls for, so the pipeline view and the
+    -- CPI report show the real Pentium (P54C) latencies instead of 1 cycle. The
+    -- result is computed in the first EX/LOAD cycle; these are the hold cycles
+    -- that follow (total = this + 1). 0 for everything that is not MUL/IMUL/DIV.
+    function muldiv_wait(op : std_logic_vector(7 downto 0); is0f : std_logic;
+                         m : std_logic_vector(7 downto 0)) return integer is
+    begin
+        if is0f = '1' then
+            if op = x"AF" then return 9; else return 0; end if;   -- IMUL r,r/m  (~10)
+        end if;
+        case op is
+            when x"69" | x"6B" => return 9;                       -- IMUL r,r/m,imm (~10)
+            when x"F7" =>
+                case m(5 downto 3) is
+                    when "100" => return 10;                      -- MUL  (~11)
+                    when "101" => return 9;                       -- IMUL (~10)
+                    when "110" => return 40;                      -- DIV  (~41)
+                    when "111" => return 45;                      -- IDIV (~46)
+                    when others => return 0;                      -- TEST/NOT/NEG
+                end case;
+            when others => return 0;
+        end case;
     end function;
 
     -- First EX micro-state. Instructions whose first action is a memory access
@@ -656,10 +835,12 @@ architecture superscalar of x86_cpu is
             case op is
                 when x"01" => return S_LIDT0;
                 when x"B1" => return S_CMPX_R;
-                when x"B6" => if memf then return S_LOAD; end if;
+                when x"B6" | x"B7" | x"BE" | x"BF" => if memf then return S_LOAD; end if;  -- MOVZX/MOVSX
+                when x"AF" => if memf then return S_LOAD; end if;    -- IMUL r32,[m]
                 when x"28" | x"6E" | x"6F" => if memf then return S_XMM_LD; end if;
                 when x"29" | x"7E" | x"7F" => if memf then return S_XMM_ST; end if;
-                when others => null;
+                when others =>
+                    if op(7 downto 4) = x"9" and memf then return S_STORE; end if;  -- SETcc [m8]
             end case;
             return S_EXECUTE;
         end if;
@@ -668,10 +849,20 @@ architecture superscalar of x86_cpu is
             when x"A2" | x"A3" => return S_STORE;
             when x"8A" | x"8B" => if memf then return S_LOAD; end if;
             when x"88" | x"89" | x"C6" | x"C7" => if memf then return S_STORE; end if;
+            -- ALU with a memory operand: a single load (then a store back if RMW).
+            -- Routing them here (not S_EXECUTE) also keeps simple_u from pairing them.
+            when x"01" | x"03" | x"09" | x"0B" | x"11" | x"13" | x"19" | x"1B" |
+                 x"21" | x"23" | x"29" | x"2B" | x"31" | x"33" | x"39" | x"3B" |
+                 x"85" | x"81" | x"83" |
+                 x"00" | x"02" | x"08" | x"0A" | x"10" | x"12" | x"18" | x"1A" |
+                 x"20" | x"22" | x"28" | x"2A" | x"30" | x"32" | x"38" | x"3A" |
+                 x"80" | x"84" |                                    -- byte ALU / grp1 r/m8 / TEST r/m8
+                 x"69" | x"6B" | x"C1" | x"D1" | x"D3" | x"FF" | x"F7" =>  -- +grp3 (TEST/NOT/NEG/MUL/DIV)
+                if memf then return S_LOAD; end if;
             when x"50" | x"51" | x"52" | x"53" | x"54" | x"55" | x"56" | x"57" |
                  x"68" | x"6A" | x"9C" => return S_PUSH;
             when x"58" | x"59" | x"5A" | x"5B" | x"5C" | x"5D" | x"5E" | x"5F" |
-                 x"9D" => return S_POP;
+                 x"9D" | x"C9" => return S_POP;                 -- POP / POPFD / LEAVE
             when x"60" => return S_PUSHA;
             when x"61" => return S_POPA;
             when x"E8" => return S_CALL_PUSH;
@@ -735,6 +926,7 @@ architecture superscalar of x86_cpu is
     signal ea_al     : unsigned(31 downto 0);          -- ea rounded down to its dword
     signal split     : std_logic;                      -- access straddles two dwords
     signal ldv       : std_logic_vector(31 downto 0);  -- load value, lanes aligned
+    signal rmw_res   : unsigned(31 downto 0) := (others => '0');  -- RMW ALU result to store
     signal immv      : std_logic_vector(31 downto 0);  -- immediate of a ModR/M insn
     signal eflags_v  : std_logic_vector(31 downto 0);  -- architectural EFLAGS image
     signal dis       : dis_table := load_disasm(DISASM_FILE);
@@ -768,6 +960,7 @@ architecture superscalar of x86_cpu is
         p66    : std_logic;
         plock  : std_logic;
         modrm  : std_logic_vector(7 downto 0);
+        sib    : std_logic_vector(7 downto 0);    -- scale/index/base byte (when rm=100)
         oprnd  : std_logic_vector(31 downto 0);   -- displacement, or immediate
         imm_r  : std_logic_vector(31 downto 0);   -- immediate after a displacement
         disp_n : integer range 0 to 4;
@@ -777,7 +970,7 @@ architecture superscalar of x86_cpu is
         pred_tgt : unsigned(31 downto 0); -- ... to this target
     end record;
     constant NO_INSN : insn_t := ('0', (others => '0'), (others => '0'), x"00", '0', '0', '0',
-                                  x"00", (others => '0'), (others => '0'), 0, '0', (others => '0'),
+                                  x"00", x"00", (others => '0'), (others => '0'), 0, '0', (others => '0'),
                                   '0', (others => '0'));
     signal d1      : insn_t;                  -- decoded at the queue head (combinational)
     signal d1_ok   : std_logic;               -- ... all its bytes are in the queue
@@ -853,13 +1046,13 @@ architecture superscalar of x86_cpu is
         variable i, dl, il, n : integer range 0 to 99;
         variable av : integer;          -- bytes available from base (may clamp to 0)
         variable p66, plk, is0f : std_logic;
-        variable op, m : std_logic_vector(7 downto 0);
+        variable op, m, sb : std_logic_vector(7 downto 0);
         variable r  : insn_t;
         variable ok, short : boolean;
         variable res : decoded_t;
     begin
         r := NO_INSN; i := 0; p66 := '0'; plk := '0'; is0f := '0';
-        op := x"00"; m := x"00"; dl := 0; il := 0; short := false;
+        op := x"00"; m := x"00"; sb := x"00"; dl := 0; il := 0; short := false;
         av := cnt - base;
         if av < 0 then av := 0; end if;
         if av > 99 then av := 99; end if;
@@ -881,7 +1074,12 @@ architecture superscalar of x86_cpu is
         if not short then
             if (is0f = '1' and op(7 downto 4) /= x"8") or (is0f = '0' and has_modrm(op)) then
                 if i < av and base + i < PQ_SIZE then
-                    m := q(base + i); dl := disp_len(m); il := imm_len_grp(op, is0f, p66); i := i + 1;
+                    m := q(base + i); i := i + 1;
+                    if has_sib(m) then                      -- consume the SIB byte
+                        if i < av and base + i < PQ_SIZE then sb := q(base + i); i := i + 1;
+                        else short := true; end if;
+                    end if;
+                    dl := disp_len_s(m, sb); il := imm_len_grp(op, is0f, p66, m);
                 else
                     short := true;
                 end if;
@@ -896,7 +1094,7 @@ architecture superscalar of x86_cpu is
         if ok then
             r.valid := '1'; r.eip := eip0; r.nxt := eip0 + n;
             r.ir0 := op; r.is0f := is0f; r.p66 := p66; r.plock := plk;
-            r.modrm := m; r.disp_n := dl; r.seq := sq;
+            r.modrm := m; r.sib := sb; r.disp_n := dl; r.seq := sq;
             for k in 0 to 3 loop
                 if dl > 0 then
                     if k < dl and base + i + k < PQ_SIZE then r.oprnd(8*k+7 downto 8*k) := q(base + i + k); end if;
@@ -1094,16 +1292,21 @@ begin
         elsif d2.is0f = '0' and d2.ir0 = x"D7" then
             ea_d2 <= std_logic_vector(reg(R_EBX) + resize(reg(R_EAX)(7 downto 0), 32)); -- XLAT
         else
-            ea_d2 <= ea_of(d2.modrm, d2.oprnd, reg);
+            ea_d2 <= ea_of(d2.modrm, d2.sib, d2.oprnd, reg);
         end if;
     end process;
 
     -- Data access size of a load/store.
     msize <= "00" when (ir_0f = '0' and (ir0 = x"88" or ir0 = x"8A" or ir0 = x"C6" or ir0 = x"D7" or
                                          ir0 = x"A0" or ir0 = x"A2"))
-                    or (ir_0f = '1' and ir0 = x"B6") else
-             "01" when opsz16 = '1' and ir_0f = '0' and (ir0 = x"89" or ir0 = x"8B" or ir0 = x"C7" or
-                                                         ir0 = x"A1" or ir0 = x"A3") else
+                    or (ir_0f = '0' and (is_alu8(ir0) or ir0 = x"80" or ir0 = x"84"))  -- byte ALU/grp1/TEST
+                    or (ir_0f = '1' and (ir0 = x"B6" or ir0 = x"BE"))  -- MOVZX/MOVSX r/m8
+                    or (ir_0f = '1' and ir0(7 downto 4) = x"9")        -- SETcc [m8]
+                    else
+             "01" when (opsz16 = '1' and ir_0f = '0' and (ir0 = x"89" or ir0 = x"8B" or ir0 = x"C7" or
+                                                          ir0 = x"A1" or ir0 = x"A3"))
+                    or (ir_0f = '1' and (ir0 = x"B7" or ir0 = x"BF"))  -- MOVZX/MOVSX r/m16
+                    else
              "10";
 
     -- Misaligned data: the operand starts at byte ea_k of a dword; if it runs
@@ -1159,6 +1362,8 @@ begin
                         nxt := S_CMPX_R;                    -- CMPXCHG
                     elsif ir0 = x"B6" then                  -- MOVZX r32, r/m8
                         if modrm(7 downto 6) /= "11" then nxt := S_LOAD; end if;
+                    elsif ir0 = x"AF" and modrm(7 downto 6) = "11" then
+                        nxt := S_MULDIV_WAIT;               -- IMUL r32,r32 : multi-cycle
                     elsif is_sse(ir0) and modrm(7 downto 6) /= "11" then
                         if ir0 = x"28" or ir0 = x"6E" or ir0 = x"6F" then
                             nxt := S_XMM_LD;                -- MOVAPS/MOVD/MOVDQA load
@@ -1175,6 +1380,11 @@ begin
                             if modrm(7 downto 6) /= "11" then nxt := S_LOAD; end if;
                         when x"89" | x"88" | x"C6" | x"C7" =>  -- MOV r/m, reg|imm : store
                             if modrm(7 downto 6) /= "11" then nxt := S_STORE; end if;
+                        -- ALU with a memory operand: load it (then store back if RMW)
+                        when x"01" | x"03" | x"09" | x"0B" | x"11" | x"13" | x"19" | x"1B" |
+                             x"21" | x"23" | x"29" | x"2B" | x"31" | x"33" | x"39" | x"3B" |
+                             x"85" | x"81" | x"83" =>
+                            if modrm(7 downto 6) /= "11" then nxt := S_LOAD; end if;
                         when x"50" | x"51" | x"52" | x"53" |
                              x"54" | x"55" | x"56" | x"57" |
                              x"68" | x"6A" | x"9C" => nxt := S_PUSH;  -- PUSH r32/imm/PUSHFD
@@ -1189,12 +1399,27 @@ begin
                         when x"87" => nxt := S_XCHG_R;
                         when x"E4" | x"E5" | x"EC" | x"ED" => nxt := S_IN;
                         when x"E6" | x"E7" | x"EE" | x"EF" => nxt := S_OUT;
+                        -- register-form MUL/IMUL/DIV (F7) and IMUL r,r/m,imm: hold
+                        -- EX for the Pentium latency; NOT/NEG/TEST keep 1 cycle.
+                        when x"F7" =>
+                            if modrm(7 downto 6) = "11"
+                               and muldiv_wait(ir0, '0', modrm) > 0 then nxt := S_MULDIV_WAIT; end if;
+                        when x"69" | x"6B" =>
+                            if modrm(7 downto 6) = "11" then nxt := S_MULDIV_WAIT; end if;
                         when others => nxt := S_IDLE;
                     end case;
                 end if;
 
             when S_LOAD | S_STORE =>                         -- 2 cycles if misaligned
-                if split = '1' and q_idx = 0 then nxt := state; else nxt := S_IDLE; end if;
+                if split = '1' and q_idx = 0 then nxt := state;
+                elsif state = S_LOAD and mem_alu_wb(ir0, modrm) then nxt := S_STORE;  -- RMW
+                elsif state = S_LOAD and muldiv_wait(ir0, ir_0f, modrm) > 0 then
+                    nxt := S_MULDIV_WAIT;                    -- MUL/IMUL/DIV from memory
+                else nxt := S_IDLE; end if;
+
+            when S_MULDIV_WAIT =>                            -- hold for the P54C latency
+                if md_cnt + 1 >= muldiv_wait(ir0, ir_0f, modrm) then nxt := S_IDLE;
+                else nxt := S_MULDIV_WAIT; end if;
             when S_PUSH | S_POP | S_CALL_PUSH | S_RET_POP |
                  S_CMPX_W | S_LIDT1 | S_IN | S_OUT =>
                 nxt := S_IDLE;
@@ -1253,6 +1478,12 @@ begin
         variable digit      : std_logic_vector(2 downto 0);
         variable old_cf     : std_logic;
         variable bv         : std_logic_vector(7 downto 0);
+        variable prod       : signed(63 downto 0);    -- IMUL/MUL product
+        variable scnt       : integer range 0 to 255; -- shift / rotate count (pre-mask)
+        variable pu64       : unsigned(63 downto 0);   -- MUL / DIV dividend-product (unsigned)
+        variable ps64       : signed(63 downto 0);     -- IMUL / IDIV (signed)
+        variable qu, ru     : unsigned(63 downto 0);   -- DIV quotient / remainder
+        variable qs, rs     : signed(63 downto 0);     -- IDIV quotient / remainder
 
         procedure set_szp(v : unsigned(31 downto 0)) is
         begin
@@ -1303,6 +1534,102 @@ begin
             set_szp(v);
         end procedure;
 
+        -- Signed 32x32 multiply (IMUL two/three-operand). res = low 32 bits;
+        -- CF=OF=1 iff the full product does not fit in a signed 32-bit value.
+        procedure do_imul(x, y : signed(31 downto 0)) is
+            variable p : signed(63 downto 0);
+        begin
+            p := x * y;
+            res := unsigned(p(31 downto 0));
+            if (p(63 downto 32) = x"00000000" and p(31) = '0') or
+               (p(63 downto 32) = x"FFFFFFFF" and p(31) = '1') then
+                cf <= '0'; of_f <= '0';
+            else
+                cf <= '1'; of_f <= '1';
+            end if;
+            set_szp(res);
+        end procedure;
+
+        -- 32-bit shift / rotate (group /0 ROL /1 ROR /4 SHL /5 SHR /7 SAR). The
+        -- count is masked to 5 bits (x86); a zero count leaves value and flags
+        -- unchanged. OF is defined only for a 1-bit shift. Sets res + CF/OF (+SZP
+        -- for the shifts). cnt is the raw operand (imm8 / CL / 1).
+        procedure do_shift(dg : std_logic_vector(2 downto 0);
+                           val : unsigned(31 downto 0); cnt : integer) is
+            variable n : integer range 0 to 31;
+            variable r : unsigned(31 downto 0);
+        begin
+            n := cnt mod 32;
+            if n = 0 then res := val; return; end if;       -- no change, flags intact
+            case dg is
+                when "100" =>                                -- SHL
+                    r := shift_left(val, n); cf <= val(32 - n);
+                    if cnt = 1 then of_f <= val(32 - n) xor r(31); end if;
+                    res := r; set_szp(r);
+                when "101" =>                                -- SHR
+                    r := shift_right(val, n); cf <= val(n - 1);
+                    if cnt = 1 then of_f <= val(31); end if;
+                    res := r; set_szp(r);
+                when "111" =>                                -- SAR
+                    r := unsigned(shift_right(signed(val), n)); cf <= val(n - 1);
+                    if cnt = 1 then of_f <= '0'; end if;
+                    res := r; set_szp(r);
+                when "000" =>                                -- ROL
+                    r := rotate_left(val, n); cf <= r(0);
+                    if cnt = 1 then of_f <= r(0) xor r(31); end if;
+                    res := r;
+                when others =>                               -- ROR
+                    r := rotate_right(val, n); cf <= r(31);
+                    if cnt = 1 then of_f <= r(31) xor r(30); end if;
+                    res := r;
+            end case;
+        end procedure;
+
+        -- grp3 (F7): /0,/1 TEST (flags), /2 NOT, /3 NEG, /4 MUL, /5 IMUL (EDX:EAX),
+        -- /6 DIV, /7 IDIV. MUL/DIV write EDX:EAX directly; NOT/NEG set res for the
+        -- caller to write back. Divide-by-zero or quotient overflow raises #DE.
+        procedure do_grp3(dg : std_logic_vector(2 downto 0); val : unsigned(31 downto 0)) is
+            variable pu, dvdu, qq, rr : unsigned(63 downto 0);
+            variable pss, dvds, qsg, rsg : signed(63 downto 0);
+        begin
+            dvdu(63 downto 32) := reg(2);  dvdu(31 downto 0) := reg(R_EAX);   -- EDX:EAX
+            dvds := signed(dvdu);
+            case dg is
+                when "000" | "001" => flags_logic(val and unsigned(immv));    -- TEST r/m, imm
+                when "010" => res := not val;                                 -- NOT (no flags)
+                when "011" => flags_sub(to_unsigned(0, 32), val, '0');        -- NEG (CF=val/=0)
+                when "100" =>                                                 -- MUL (unsigned)
+                    pu := reg(R_EAX) * val;
+                    reg(R_EAX) <= pu(31 downto 0); reg(2) <= pu(63 downto 32);
+                    if pu(63 downto 32) = 0 then cf <= '0'; of_f <= '0';
+                    else cf <= '1'; of_f <= '1'; end if;
+                when "101" =>                                                 -- IMUL (signed)
+                    pss := signed(reg(R_EAX)) * signed(val);
+                    reg(R_EAX) <= unsigned(pss(31 downto 0)); reg(2) <= unsigned(pss(63 downto 32));
+                    if (pss(63 downto 32) = 0 and pss(31) = '0') or
+                       (pss(63 downto 32) = x"FFFFFFFF" and pss(31) = '1') then
+                        cf <= '0'; of_f <= '0'; else cf <= '1'; of_f <= '1'; end if;
+                when "110" =>                                                 -- DIV (unsigned)
+                    if val = 0 then vec_num <= to_unsigned(0, 8); exc_fault <= '1';
+                    else
+                        qq := dvdu / resize(val, 64);
+                        rr := dvdu rem resize(val, 64);
+                        if qq(63 downto 32) /= 0 then vec_num <= to_unsigned(0, 8); exc_fault <= '1';
+                        else reg(R_EAX) <= qq(31 downto 0); reg(2) <= rr(31 downto 0); end if;
+                    end if;
+                when others =>                                                -- IDIV (signed)
+                    if val = 0 then vec_num <= to_unsigned(0, 8); exc_fault <= '1';
+                    else
+                        qsg := dvds / resize(signed(val), 64);
+                        rsg := dvds rem resize(signed(val), 64);
+                        if (qsg(63 downto 32) = 0 and qsg(31) = '0') or
+                           (qsg(63 downto 32) = x"FFFFFFFF" and qsg(31) = '1') then
+                            reg(R_EAX) <= unsigned(qsg(31 downto 0)); reg(2) <= unsigned(rsg(31 downto 0));
+                        else vec_num <= to_unsigned(0, 8); exc_fault <= '1'; end if;
+                    end if;
+            end case;
+        end procedure;
+
         -- 8-bit forms (AL): same rules, with the sign / carry at bit 7 / bit 8.
         procedure flags_sub8(x, y : unsigned(7 downto 0)) is
             variable w : unsigned(8 downto 0);
@@ -1322,6 +1649,35 @@ begin
             res8 := v;
             cf <= '0'; of_f <= '0'; af <= '0';
             set_szp8(v);
+        end procedure;
+
+        -- 8-bit ALU, selected by aluop (the ModR/M reg field / opcode bits 5..3):
+        -- 000 ADD 001 OR 010 ADC 011 SBB 100 AND 101 SUB 110 XOR 111 CMP. Result
+        -- in res8; CMP sets flags only (caller suppresses the write-back). ADC/SBB
+        -- fold in the incoming carry (the live cf signal).
+        procedure do_alu8(aluop : std_logic_vector(2 downto 0); x, y : unsigned(7 downto 0)) is
+            variable w  : unsigned(8 downto 0);
+            variable nn : unsigned(4 downto 0);
+        begin
+            case aluop is
+                when "001" => flags_logic8(x or  y);
+                when "100" => flags_logic8(x and y);
+                when "110" => flags_logic8(x xor y);
+                when "000" | "010" =>                               -- ADD / ADC
+                    w  := ('0' & x) + ('0' & y);
+                    nn := ('0' & x(3 downto 0)) + ('0' & y(3 downto 0));
+                    if aluop = "010" and cf = '1' then w := w + 1; nn := nn + 1; end if;
+                    res8 := w(7 downto 0);
+                    cf <= w(8); of_f <= (x(7) xnor y(7)) and (w(7) xor x(7));
+                    af <= nn(4); set_szp8(w(7 downto 0));
+                when others =>                                       -- SUB / SBB / CMP
+                    w  := ('0' & x) - ('0' & y);
+                    nn := ('0' & x(3 downto 0)) - ('0' & y(3 downto 0));
+                    if aluop = "011" and cf = '1' then w := w - 1; nn := nn - 1; end if;
+                    res8 := w(7 downto 0);
+                    cf <= w(8); of_f <= (x(7) xor y(7)) and (w(7) xor x(7));
+                    af <= nn(4); set_szp8(w(7 downto 0));
+            end case;
         end procedure;
 
         -- Write an x86 8-bit register (AL CL DL BL AH CH DH BH).
@@ -1404,6 +1760,29 @@ begin
                         elsif ir0 = x"B6" then                    -- MOVZX r32, r8
                             if modrm(7 downto 6) = "11" then
                                 reg(rg_i) <= resize(unsigned(get_r8(reg, rm_i)), 32);
+                            end if;
+                        elsif ir0 = x"B7" then                    -- MOVZX r32, r16
+                            if modrm(7 downto 6) = "11" then
+                                reg(rg_i) <= resize(reg(rm_i)(15 downto 0), 32);
+                            end if;
+                        elsif ir0 = x"BE" then                    -- MOVSX r32, r8
+                            if modrm(7 downto 6) = "11" then
+                                reg(rg_i) <= unsigned(resize(signed(get_r8(reg, rm_i)), 32));
+                            end if;
+                        elsif ir0 = x"BF" then                    -- MOVSX r32, r16
+                            if modrm(7 downto 6) = "11" then
+                                reg(rg_i) <= unsigned(resize(signed(reg(rm_i)(15 downto 0)), 32));
+                            end if;
+                        elsif ir0(7 downto 4) = x"9" then         -- SETcc r/m8
+                            if modrm(7 downto 6) = "11" then
+                                if cond_true(ir0(3 downto 0), zf, cf, sf, of_f, pf) then
+                                    set_r8(rm_i, x"01");
+                                else set_r8(rm_i, x"00"); end if;
+                            end if;
+                        elsif ir0 = x"AF" then                    -- IMUL r32, r/m32
+                            if modrm(7 downto 6) = "11" then
+                                do_imul(signed(reg(rg_i)), signed(reg(rm_i)));
+                                reg(rg_i) <= res;
                             end if;
                         elsif is_sse(ir0) and modrm(7 downto 6) = "11" then
                             -- SSE register-direct forms (single cycle)
@@ -1528,57 +1907,132 @@ begin
                                 flags_sub8(reg(R_EAX)(7 downto 0), unsigned(oprnd(7 downto 0)));
 
                             when x"81" | x"83" =>
-                                digit := modrm(5 downto 3);
-                                a := reg(rm_i);
-                                imm := unsigned(oprnd);
-                                if ir0 = x"83" and oprnd(7) = '1' then
-                                    imm(31 downto 8) := (others => '1');
+                                if modrm(7 downto 6) = "11" then      -- reg form (memory -> S_LOAD)
+                                    digit := modrm(5 downto 3);
+                                    a := reg(rm_i);
+                                    imm := unsigned(oprnd);
+                                    if ir0 = x"83" and oprnd(7) = '1' then
+                                        imm(31 downto 8) := (others => '1');
+                                    end if;
+                                    case digit is
+                                        when "000" => flags_add(a, imm, '0'); reg(rm_i) <= res;
+                                        when "001" => flags_logic(a or imm);  reg(rm_i) <= res;
+                                        when "010" => flags_add(a, imm, cf);  reg(rm_i) <= res;
+                                        when "011" => flags_sub(a, imm, cf);  reg(rm_i) <= res;
+                                        when "100" => flags_logic(a and imm); reg(rm_i) <= res;
+                                        when "101" => flags_sub(a, imm, '0'); reg(rm_i) <= res;
+                                        when "110" => flags_logic(a xor imm); reg(rm_i) <= res;
+                                        when others => flags_sub(a, imm, '0');   -- CMP (flags only)
+                                    end case;
                                 end if;
-                                case digit is
-                                    when "000" => flags_add(a, imm, '0'); reg(rm_i) <= res;
-                                    when "001" => flags_logic(a or imm);  reg(rm_i) <= res;
-                                    when "010" => flags_add(a, imm, cf);  reg(rm_i) <= res;
-                                    when "011" => flags_sub(a, imm, cf);  reg(rm_i) <= res;
-                                    when "100" => flags_logic(a and imm); reg(rm_i) <= res;
-                                    when "101" => flags_sub(a, imm, '0'); reg(rm_i) <= res;
-                                    when "110" => flags_logic(a xor imm); reg(rm_i) <= res;
-                                    when others => flags_sub(a, imm, '0');
-                                end case;
 
-                            when x"01" => flags_add(reg(rm_i), reg(rg_i), '0'); reg(rm_i) <= res;
-                            when x"03" => flags_add(reg(rg_i), reg(rm_i), '0'); reg(rg_i) <= res;
-                            when x"29" => flags_sub(reg(rm_i), reg(rg_i), '0'); reg(rm_i) <= res;
-                            when x"39" => flags_sub(reg(rm_i), reg(rg_i), '0');
-                            when x"21" => flags_logic(reg(rm_i) and reg(rg_i)); reg(rm_i) <= res;
-                            when x"09" => flags_logic(reg(rm_i) or  reg(rg_i)); reg(rm_i) <= res;
-                            when x"31" => flags_logic(reg(rm_i) xor reg(rg_i)); reg(rm_i) <= res;
-                            when x"85" => flags_logic(reg(rm_i) and reg(rg_i));
+                            -- ALU register forms, both directions. ir0(5:3) picks the op
+                            -- (ADD/OR/ADC/SBB/AND/SUB/XOR/CMP); ir0(1) the direction
+                            -- (0 = r/m op= r, 1 = r op= r/m). Memory forms go to S_LOAD.
+                            when x"01" | x"03" | x"09" | x"0B" | x"11" | x"13" | x"19" | x"1B" |
+                                 x"21" | x"23" | x"29" | x"2B" | x"31" | x"33" | x"39" | x"3B" =>
+                                if modrm(7 downto 6) = "11" then
+                                    if ir0(1) = '1' then a := reg(rg_i); imm := reg(rm_i);
+                                    else                 a := reg(rm_i); imm := reg(rg_i); end if;
+                                    digit := ir0(5 downto 3);
+                                    case digit is
+                                        when "000" => flags_add(a, imm, '0');
+                                        when "001" => flags_logic(a or imm);
+                                        when "010" => flags_add(a, imm, cf);
+                                        when "011" => flags_sub(a, imm, cf);
+                                        when "100" => flags_logic(a and imm);
+                                        when "101" => flags_sub(a, imm, '0');
+                                        when "110" => flags_logic(a xor imm);
+                                        when others => flags_sub(a, imm, '0');   -- CMP (flags only)
+                                    end case;
+                                    if digit /= "111" then                       -- not CMP: write dest
+                                        if ir0(1) = '1' then reg(rg_i) <= res;
+                                        else                 reg(rm_i) <= res; end if;
+                                    end if;
+                                end if;
+                            when x"85" =>                                         -- TEST r/m, r
+                                if modrm(7 downto 6) = "11" then
+                                    flags_logic(reg(rm_i) and reg(rg_i));
+                                end if;
 
-                            when x"D1" =>
-                                a := reg(rm_i);
-                                digit := modrm(5 downto 3);
-                                case digit is
-                                    when "100" =>
-                                        res := a(30 downto 0) & '0';
-                                        cf <= a(31); of_f <= a(31) xor res(31);
-                                        set_szp(res); reg(rm_i) <= res;
-                                    when "101" =>
-                                        res := '0' & a(31 downto 1);
-                                        cf <= a(0); of_f <= a(31);
-                                        set_szp(res); reg(rm_i) <= res;
-                                    when "111" =>
-                                        res := a(31) & a(31 downto 1);
-                                        cf <= a(0); of_f <= '0';
-                                        set_szp(res); reg(rm_i) <= res;
-                                    when "000" =>
-                                        res := a(30 downto 0) & a(31);
-                                        cf <= a(31); of_f <= a(31) xor res(31);
-                                        reg(rm_i) <= res;
-                                    when others =>
-                                        res := a(0) & a(31 downto 1);
-                                        cf <= a(0); of_f <= res(31) xor res(30);
-                                        reg(rm_i) <= res;
-                                end case;
+                            -- byte ALU register forms, both directions (ir0(1)):
+                            -- the 8-bit twin of the ADD..CMP block above.
+                            when x"00" | x"02" | x"08" | x"0A" | x"10" | x"12" | x"18" | x"1A" |
+                                 x"20" | x"22" | x"28" | x"2A" | x"30" | x"32" | x"38" | x"3A" =>
+                                if modrm(7 downto 6) = "11" then
+                                    if ir0(1) = '1' then        -- load-dir: r8 <- r8 op r/m8
+                                        do_alu8(ir0(5 downto 3),
+                                                unsigned(get_r8(reg, rg_i)), unsigned(get_r8(reg, rm_i)));
+                                        if ir0(5 downto 3) /= "111" then
+                                            set_r8(rg_i, std_logic_vector(res8)); end if;
+                                    else                        -- store-dir: r/m8 <- r/m8 op r8
+                                        do_alu8(ir0(5 downto 3),
+                                                unsigned(get_r8(reg, rm_i)), unsigned(get_r8(reg, rg_i)));
+                                        if ir0(5 downto 3) /= "111" then
+                                            set_r8(rm_i, std_logic_vector(res8)); end if;
+                                    end if;
+                                end if;
+                            when x"80" =>                                         -- grp1 r/m8, imm8
+                                if modrm(7 downto 6) = "11" then
+                                    do_alu8(modrm(5 downto 3),
+                                            unsigned(get_r8(reg, rm_i)), unsigned(oprnd(7 downto 0)));
+                                    if modrm(5 downto 3) /= "111" then
+                                        set_r8(rm_i, std_logic_vector(res8)); end if;
+                                end if;
+                            when x"84" =>                                         -- TEST r/m8, r8
+                                if modrm(7 downto 6) = "11" then
+                                    flags_logic8(unsigned(get_r8(reg, rm_i)) and unsigned(get_r8(reg, rg_i)));
+                                end if;
+
+                            -- shift / rotate r/m32: by 1 (D1), by CL (D3) or imm8 (C1)
+                            when x"C1" | x"D1" | x"D3" =>
+                                if modrm(7 downto 6) = "11" then
+                                    if    ir0 = x"D1" then scnt := 1;
+                                    elsif ir0 = x"D3" then scnt := to_integer(reg(1)(7 downto 0));  -- CL
+                                    else  scnt := to_integer(unsigned(immv(7 downto 0)));  -- C1
+                                    end if;
+                                    do_shift(modrm(5 downto 3), reg(rm_i), scnt);
+                                    reg(rm_i) <= res;
+                                end if;
+
+                            when x"69" =>                        -- IMUL r32, r/m32, imm32
+                                if modrm(7 downto 6) = "11" then
+                                    do_imul(signed(reg(rm_i)), signed(immv));
+                                    reg(rg_i) <= res;
+                                end if;
+                            when x"6B" =>                        -- IMUL r32, r/m32, imm8
+                                if modrm(7 downto 6) = "11" then
+                                    imm := unsigned(immv);
+                                    if immv(7) = '1' then imm(31 downto 8) := (others => '1'); end if;
+                                    do_imul(signed(reg(rm_i)), signed(imm));
+                                    reg(rg_i) <= res;
+                                end if;
+                            when x"8D" =>                        -- LEA r32, m (the computed EA)
+                                reg(rg_i) <= unsigned(ea);
+                            when x"FF" =>                        -- INC/DEC r/m32 (grp5 /0 /1)
+                                if modrm(7 downto 6) = "11" then
+                                    a := reg(rm_i);
+                                    if modrm(5 downto 3) = "000" then
+                                        flags_add(a, to_unsigned(1, 32), '0');
+                                    else
+                                        flags_sub(a, to_unsigned(1, 32), '0');
+                                    end if;
+                                    cf <= old_cf;                -- INC/DEC leave CF unchanged
+                                    reg(rm_i) <= res;
+                                end if;
+                            when x"F7" =>                        -- grp3: TEST/NOT/NEG/MUL/IMUL/DIV/IDIV
+                                if modrm(7 downto 6) = "11" then
+                                    do_grp3(modrm(5 downto 3), reg(rm_i));
+                                    if modrm(5 downto 3) = "010" or modrm(5 downto 3) = "011" then
+                                        reg(rm_i) <= res;        -- NOT / NEG write r/m
+                                    end if;
+                                end if;
+                            when x"99" =>                        -- CDQ: EDX = sign-extend EAX
+                                if reg(R_EAX)(31) = '1' then reg(2) <= (others => '1');
+                                else reg(2) <= (others => '0'); end if;
+                            when x"98" =>                        -- CWDE: EAX = sign-extend AX
+                                if reg(R_EAX)(15) = '1' then reg(R_EAX)(31 downto 16) <= (others => '1');
+                                else reg(R_EAX)(31 downto 16) <= (others => '0'); end if;
 
                             when x"EB" =>
                                 rel := unsigned(oprnd);
@@ -1704,6 +2158,102 @@ begin
                     if split = '1' and q_idx = 0 then
                         lo_tmp <= data_in;                               -- 1st half of a split load
                         q_idx <= 1;
+                    elsif ir_0f = '0' and (ir0 = x"81" or ir0 = x"83") then
+                        -- grp1 [mem], imm : compute, flags, latch result for the store
+                        digit := modrm(5 downto 3);
+                        a := unsigned(ldv);
+                        imm := unsigned(immv);
+                        if ir0 = x"83" and immv(7) = '1' then imm(31 downto 8) := (others => '1'); end if;
+                        case digit is
+                            when "000" => flags_add(a, imm, '0');
+                            when "001" => flags_logic(a or imm);
+                            when "010" => flags_add(a, imm, cf);
+                            when "011" => flags_sub(a, imm, cf);
+                            when "100" => flags_logic(a and imm);
+                            when "101" => flags_sub(a, imm, '0');
+                            when "110" => flags_logic(a xor imm);
+                            when others => flags_sub(a, imm, '0');       -- CMP (flags only)
+                        end case;
+                        rmw_res <= res; q_idx <= 0;
+                    elsif ir_0f = '0' and ir0 = x"85" then               -- TEST [mem], r (flags only)
+                        flags_logic(unsigned(ldv) and reg(rg_i));
+                    elsif ir_0f = '0' and (ir0 = x"01" or ir0 = x"03" or ir0 = x"09" or ir0 = x"0B" or
+                           ir0 = x"11" or ir0 = x"13" or ir0 = x"19" or ir0 = x"1B" or
+                           ir0 = x"21" or ir0 = x"23" or ir0 = x"29" or ir0 = x"2B" or
+                           ir0 = x"31" or ir0 = x"33" or ir0 = x"39" or ir0 = x"3B") then
+                        -- ADD..CMP with a memory operand. ir0(1): 1 = r <- r op [m] (write
+                        -- register), 0 = [m] <- [m] op r (latch result for the RMW store).
+                        if ir0(1) = '1' then a := reg(rg_i); imm := unsigned(ldv);
+                        else                 a := unsigned(ldv); imm := reg(rg_i); end if;
+                        digit := ir0(5 downto 3);
+                        case digit is
+                            when "000" => flags_add(a, imm, '0');
+                            when "001" => flags_logic(a or imm);
+                            when "010" => flags_add(a, imm, cf);
+                            when "011" => flags_sub(a, imm, cf);
+                            when "100" => flags_logic(a and imm);
+                            when "101" => flags_sub(a, imm, '0');
+                            when "110" => flags_logic(a xor imm);
+                            when others => flags_sub(a, imm, '0');       -- CMP (flags only)
+                        end case;
+                        if ir0(1) = '1' then
+                            if digit /= "111" then reg(rg_i) <= res; end if;  -- not CMP
+                        else
+                            rmw_res <= res; q_idx <= 0;                   -- RMW: store happens next
+                        end if;
+                    elsif ir_0f = '0' and is_alu8(ir0) then              -- byte ADD..CMP with [m8]
+                        if ir0(1) = '1' then                             -- load-dir: r8 <- r8 op [m8]
+                            do_alu8(ir0(5 downto 3), unsigned(get_r8(reg, rg_i)), unsigned(bv));
+                            if ir0(5 downto 3) /= "111" then set_r8(rg_i, std_logic_vector(res8)); end if;
+                        else                                             -- store-dir: [m8] <- [m8] op r8
+                            do_alu8(ir0(5 downto 3), unsigned(bv), unsigned(get_r8(reg, rg_i)));
+                            if ir0(5 downto 3) /= "111" then             -- CMP (111): flags only
+                                rmw_res <= resize(res8, 32); q_idx <= 0;
+                            end if;
+                        end if;
+                    elsif ir_0f = '0' and ir0 = x"80" then               -- grp1 [m8], imm8
+                        do_alu8(modrm(5 downto 3), unsigned(bv), unsigned(immv(7 downto 0)));
+                        if modrm(5 downto 3) /= "111" then               -- not CMP
+                            rmw_res <= resize(res8, 32); q_idx <= 0;
+                        end if;
+                    elsif ir_0f = '0' and ir0 = x"84" then               -- TEST [m8], r8 (flags only)
+                        flags_logic8(unsigned(bv) and unsigned(get_r8(reg, rg_i)));
+                    elsif ir_0f = '1' and ir0 = x"AF" then               -- IMUL r32, [m]
+                        do_imul(signed(reg(rg_i)), signed(ldv)); reg(rg_i) <= res;
+                    elsif ir_0f = '0' and ir0 = x"69" then               -- IMUL r32, [m], imm32
+                        do_imul(signed(ldv), signed(immv)); reg(rg_i) <= res;
+                    elsif ir_0f = '0' and ir0 = x"6B" then               -- IMUL r32, [m], imm8
+                        imm := unsigned(immv);
+                        if immv(7) = '1' then imm(31 downto 8) := (others => '1'); end if;
+                        do_imul(signed(ldv), signed(imm)); reg(rg_i) <= res;
+                    elsif ir_0f = '0' and (ir0 = x"C1" or ir0 = x"D1" or ir0 = x"D3") then  -- shift [m]
+                        if    ir0 = x"D1" then scnt := 1;
+                        elsif ir0 = x"D3" then scnt := to_integer(reg(1)(7 downto 0));
+                        else  scnt := to_integer(unsigned(immv(7 downto 0)));
+                        end if;
+                        do_shift(modrm(5 downto 3), unsigned(ldv), scnt);
+                        rmw_res <= res; q_idx <= 0;
+                    elsif ir_0f = '0' and ir0 = x"FF" then               -- INC/DEC [m] (RMW)
+                        old_cf := cf;
+                        a := unsigned(ldv);
+                        if modrm(5 downto 3) = "000" then
+                            flags_add(a, to_unsigned(1, 32), '0');
+                        else
+                            flags_sub(a, to_unsigned(1, 32), '0');
+                        end if;
+                        cf <= old_cf;
+                        rmw_res <= res; q_idx <= 0;
+                    elsif ir_0f = '0' and ir0 = x"F7" then               -- grp3 [m] (TEST/NOT/NEG/MUL/DIV)
+                        do_grp3(modrm(5 downto 3), unsigned(ldv));
+                        if modrm(5 downto 3) = "010" or modrm(5 downto 3) = "011" then
+                            rmw_res <= res; q_idx <= 0;                  -- NOT/NEG store back
+                        end if;
+                    elsif ir_0f = '1' and ir0 = x"B7" then               -- MOVZX r32,[m16]
+                        reg(rg_i) <= resize(unsigned(ldv(15 downto 0)), 32);
+                    elsif ir_0f = '1' and ir0 = x"BE" then               -- MOVSX r32,[m8]
+                        reg(rg_i) <= unsigned(resize(signed(bv), 32));
+                    elsif ir_0f = '1' and ir0 = x"BF" then               -- MOVSX r32,[m16]
+                        reg(rg_i) <= unsigned(resize(signed(ldv(15 downto 0)), 32));
                     elsif ir_0f = '1' then                               -- MOVZX r32,[m8]
                         reg(rg_i) <= resize(unsigned(bv), 32);
                     elsif ir0 = x"A1" and opsz16 = '0' then
@@ -1722,7 +2272,10 @@ begin
 
                 when S_PUSH  => reg(R_ESP) <= reg(R_ESP) - 4;
                 when S_POP =>
-                    if ir0 = x"9D" then                                  -- POPFD
+                    if ir0 = x"C9" then                                  -- LEAVE: EBP<-[EBP], ESP<-EBP+4
+                        reg(5) <= unsigned(data_in);
+                        reg(R_ESP) <= reg(5) + 4;
+                    elsif ir0 = x"9D" then                               -- POPFD
                         load_flags(data_in);
                         reg(R_ESP) <= reg(R_ESP) + 4;
                     else
@@ -1824,6 +2377,7 @@ begin
                 when S_XMM_ST =>
                     q_idx <= q_idx + 1;
 
+                when S_MULDIV_WAIT => null;   -- result already written; just burning latency
                 when S_HALT => null;
             end case;
             end if;
@@ -1848,7 +2402,10 @@ begin
                 opsz16 <= d2.p66;
                 ex_first <= '1';
                 ex_irq <= '0';
-                ex_drain <= drains(d2.ir0, d2.is0f);
+                -- SERIALIZE: drain after every instruction so none overlap in the
+                -- pipeline (models a non-pipelined machine).
+                if SERIALIZE then ex_drain <= '1';
+                else              ex_drain <= drains(d2.ir0, d2.is0f); end if;
                 if ex_entry(d2.ir0, d2.is0f, d2.modrm, d2.p66) /= S_EXECUTE then
                     sti_shadow <= '0';                -- (EXECUTE clears it otherwise)
                 end if;
@@ -1865,6 +2422,20 @@ begin
             end if;
             if next_state = S_INTA or next_state = S_INT_VEC then
                 ex_drain <= '1';
+            end if;
+        end if;
+    end process;
+
+    -- MUL/IMUL/DIV/IDIV latency counter: counts cycles spent in S_MULDIV_WAIT so
+    -- ex_next_proc can hold EX there for the Pentium latency, then drops to 0 so
+    -- the next such op starts fresh. Isolated from the datapath for clarity.
+    md_cnt_proc : process(clk, reset)
+    begin
+        if reset = '1' then
+            md_cnt <= 0;
+        elsif rising_edge(clk) then
+            if state = S_MULDIV_WAIT then md_cnt <= md_cnt + 1;
+            else                          md_cnt <= 0;
             end if;
         end if;
     end process;
@@ -1892,7 +2463,12 @@ begin
 
             when S_STORE =>
                 -- Source operand of the store.
-                if ir0 = x"A3" then
+                if mem_alu_wb(ir0, modrm) then
+                    src := std_logic_vector(rmw_res);                  -- RMW: computed ALU result
+                elsif ir_0f = '1' and ir0(7 downto 4) = x"9" then      -- SETcc [m8]
+                    if cond_true(ir0(3 downto 0), zf, cf, sf, of_f, pf) then src := x"00000001";
+                    else src := x"00000000"; end if;
+                elsif ir0 = x"A3" then
                     src := std_logic_vector(reg(R_EAX));                -- MOV moffs32,EAX
                 elsif ir0 = x"88" or ir0 = x"A2" then
                     src := x"000000" & get_r8(reg, rg_i);               -- MOV [m8],r8 / moffs8,AL
@@ -1934,7 +2510,8 @@ begin
                 end if;
                 ex_we <= '1'; ex_be <= "1111";
             when S_POP =>
-                ex_addr <= std_logic_vector(reg(R_ESP));
+                if ir0 = x"C9" then ex_addr <= std_logic_vector(reg(5));   -- LEAVE reads [EBP]
+                else                ex_addr <= std_logic_vector(reg(R_ESP)); end if;
 
             when S_PUSHA =>
                 ex_addr <= std_logic_vector(reg(R_ESP) - to_unsigned(4 * (q_idx + 1), 32));
@@ -2082,12 +2659,12 @@ begin
     d1_proc : process(all)
         variable i, dl, il, n : integer range 0 to 99;
         variable p66, plk, is0f : std_logic;
-        variable op, m : std_logic_vector(7 downto 0);
+        variable op, m, sb : std_logic_vector(7 downto 0);
         variable r  : insn_t;
         variable ok, short : boolean;
     begin
         r := NO_INSN; i := 0; p66 := '0'; plk := '0'; is0f := '0';
-        op := x"00"; m := x"00"; dl := 0; il := 0; short := false;
+        op := x"00"; m := x"00"; sb := x"00"; dl := 0; il := 0; short := false;
         while i < 4 and i < pq_cnt and is_prefix(pq(i)) loop
             if pq(i) = x"66" then p66 := '1'; end if;
             if pq(i) = x"F0" then plk := '1'; end if;
@@ -2106,7 +2683,12 @@ begin
         if not short then
             if (is0f = '1' and op(7 downto 4) /= x"8") or (is0f = '0' and has_modrm(op)) then
                 if i < pq_cnt then
-                    m := pq(i); dl := disp_len(m); il := imm_len_grp(op, is0f, p66); i := i + 1;
+                    m := pq(i); i := i + 1;
+                    if has_sib(m) then                         -- consume the SIB byte
+                        if i < pq_cnt then sb := pq(i); i := i + 1;
+                        else short := true; end if;
+                    end if;
+                    dl := disp_len_s(m, sb); il := imm_len_grp(op, is0f, p66, m);
                 else
                     short := true;
                 end if;
@@ -2121,7 +2703,7 @@ begin
         if ok then
             r.valid := '1'; r.eip := pq_eip; r.nxt := pq_eip + n;
             r.ir0 := op; r.is0f := is0f; r.p66 := p66; r.plock := plk;
-            r.modrm := m; r.disp_n := dl; r.seq := seq_ctr;
+            r.modrm := m; r.sib := sb; r.disp_n := dl; r.seq := seq_ctr;
             -- displacement -> oprnd; an immediate after a displacement -> imm_r;
             -- an immediate on its own -> oprnd (exactly as the multi-cycle core)
             for k in 0 to 3 loop
@@ -2159,7 +2741,7 @@ begin
         d1b     <= b.insn;
         d1b_ok  <= b.ok;
         d1b_len <= b.len;
-        pair_ok <= d1_ok = '1' and b.ok = '1'
+        pair_ok <= DUAL_ISSUE and d1_ok = '1' and b.ok = '1'
                    and d1.pfault = '0' and b.insn.pfault = '0'
                    and simple_u(d1.ir0, d1.is0f, d1.p66, d1.plock, d1.modrm)
                    and simple_v(b.insn.ir0, b.insn.is0f, b.insn.p66, b.insn.plock, b.insn.modrm)
@@ -2173,10 +2755,10 @@ begin
         variable r : btb_res_t;
     begin
         r := ('0', '0', (others => '0'));
-        if d1.valid = '1' and d1.pfault = '0' and is_ubranch(d1.ir0, d1.is0f) then
+        if BTB_ENABLE and d1.valid = '1' and d1.pfault = '0' and is_ubranch(d1.ir0, d1.is0f) then
             r := btb_lookup(btb, d1.eip);
         end if;
-        d1_pred_tk  <= r.hit and r.tk;
+        d1_pred_tk  <= r.hit and r.tk;    -- BTB off -> always predict not-taken
         d1_pred_tgt <= r.tgt;
     end process;
 
@@ -2318,7 +2900,7 @@ begin
         take_irq_now <= irq;
         -- AGI: D2 needs, for its address, a register the EX instruction writes.
         agiv := d2.valid = '1' and state /= S_IDLE and
-                (dest_mask(ir0, ir_0f, modrm) and use_mask(d2.ir0, d2.is0f, d2.modrm)) /= x"00";
+                (dest_mask(ir0, ir_0f, modrm) and use_mask(d2.ir0, d2.is0f, d2.modrm, d2.sib)) /= x"00";
         agi <= agiv;
         eacc := bnd and not irq and d2.valid = '1' and redir_pending = '0'
                 and not umis and not vtk and not agiv;
@@ -2576,6 +3158,9 @@ begin
     dbg_v_seq    <= std_logic_vector(v_seq);
     dbg_v_eip    <= std_logic_vector(v_eip);
     dbg_pairs    <= std_logic_vector(pairs_ctr(15 downto 0));
+    dbg_pairs32     <= std_logic_vector(pairs_ctr);
+    dbg_btb_correct <= std_logic_vector(btb_correct);
+    dbg_btb_wrong   <= std_logic_vector(btb_wrong);
     -- Disassemble the V instruction only when the pipe is cleanly valid and its
     -- address is settled (a parked/just-woken core can present a metavalue here).
     dbg_v_txt    <= dis_ascii(dis_at(dis, v_eip)) when HAVE_DIS and v_valid = '1' else
@@ -2615,7 +3200,7 @@ begin
     with state select
         dbg02_state <=
             "0000" when S_IDLE,
-            "0110" when S_EXECUTE,
+            "0110" when S_EXECUTE | S_MULDIV_WAIT,
             "0111" when S_LOAD | S_XMM_LD | S_IN,
             "1000" when S_STORE | S_XMM_ST | S_OUT,
             "1001" when S_PUSH | S_PUSHA,
@@ -2655,6 +3240,7 @@ begin
             sname("XMM_ST")        when S_XMM_ST,
             sname("IN")            when S_IN,
             sname("OUT")           when S_OUT,
+            sname("MULDIV")        when S_MULDIV_WAIT,
             sname("HALT")          when S_HALT;
 
 end superscalar;

@@ -100,8 +100,13 @@ static long long last_cycle;
 #define ST_WAVEAP (ST_SYS + 128)                /* AP pipeline sample ring (same 64-byte records) */
 #define ST_CACHE  (ST_WAVEAP + WAVE_N * WAVE_SZ) /* core-0 cache contents: D data 256B, I data 256B, D meta 8B, I meta 8B */
 #define ST_BTB    (ST_CACHE + 576)              /* both cores' BTB: 72 B each (8 tags, 8 targets, 8 meta bytes) */
-#define ST_SIZE   (ST_BTB + 256)
+/* Performance counters for the CPI report (12 u32): instructions retired, the
+ * eight stall-cause cycle buckets (0 none .. 7 halted), BTB correct/wrong, and
+ * the 32-bit U/V pair count.  Appended at the end so no earlier offset moves. */
+#define ST_PERF   (ST_BTB + 256)
+#define ST_SIZE   (ST_PERF + 128)   /* perf counters (0..44) + machine config (48..) */
 static unsigned char *st;                       /* mmap of build/pc_state.bin */
+#define PERF32(o) (*(volatile uint32_t *)(st + ST_PERF + (o)))
 #define SYS32(o) (*(volatile uint32_t *)(st + ST_SYS + (o)))
 #define ST32(off) (*(volatile uint32_t *)(st + (off)))
 static double pace_t0;
@@ -523,6 +528,28 @@ void host_sys(int v_valid, int pairs, int ap_pc, int ap_halted, int ap_stage, in
     SYS32(60) = (uint32_t)c0st;  SYS32(64) = (uint32_t)c1st;  SYS32(68) = (uint32_t)grant;
     SYS32(72) = (uint32_t)trans; SYS32(76) = (uint32_t)walks; SYS32(80) = (uint32_t)faults;
     SYS32(84) = (uint32_t)cr2;
+}
+
+/* Performance counters for the CPI report window: instructions retired, the
+ * eight stall-cause cycle buckets (0 none, 1 microcode, 2 AGI, 3 branch,
+ * 4 queue-empty, 5 mem-wait, 6 bus-busy, 7 halted), BTB correct/mispredicted,
+ * and the 32-bit U/V pair count. */
+void host_perf(int instret, int s0, int s1, int s2, int s3, int s4, int s5,
+               int s6, int s7, int btb_ok, int btb_bad, int pairs32)
+{
+    if (!st) return;
+    int v[12] = {instret, s0, s1, s2, s3, s4, s5, s6, s7, btb_ok, btb_bad, pairs32};
+    for (int i = 0; i < 12; i++) PERF32(4 * i) = (uint32_t)v[i];
+}
+
+/* The active machine configuration (static for a run), so the CPI window can
+ * label each report SUPER/SCALAR/NON-PIPELINED, BTB on/off, cache on/off, and
+ * the L1 geometry.  dual/serial/btb/cache are 0/1; sets/ways/line are counts. */
+void host_config(int dual, int serial, int btb, int cache, int sets, int ways, int line)
+{
+    if (!st) return;
+    int v[7] = {dual, serial, btb, cache, sets, ways, line};
+    for (int i = 0; i < 7; i++) PERF32(48 + 4 * i) = (uint32_t)v[i];
 }
 
 /* One clock cycle for the AP's pipeline chart -- the same 64-byte record layout

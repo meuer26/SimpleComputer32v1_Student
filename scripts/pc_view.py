@@ -59,7 +59,8 @@ CACHE    = WAVEAP + WAVE_N * WAVE_SZ        # core-0 cache contents: D 256B, I 2
 BTB      = CACHE + 576                      # both cores' BTB contents: 72 B each
 CACHE_HB = SYS + 92                         # cache-window heartbeat (ask the sim to dump the cache)
 BTB_HB   = SYS + 96                         # BTB-window heartbeat
-FULL = BTB + 256                            # total mapped size
+PERF     = BTB + 256                        # CPI-report counters (0..44) + config (48..)
+FULL = PERF + 128                           # total mapped size
 RAM_SIZE = 4096
 FADE = 1.5                      # seconds a fresh write / executed line stays lit
 SPEEDS = {ord('0'): 0, ord('1'): 10, ord('2'): 100, ord('3'): 1000,
@@ -154,6 +155,20 @@ class Shared:
             "ic_hits": u(36), "ic_miss": u(40), "dc_hits": u(44), "dc_miss": u(48),
             "inval": u(52), "wb": u(56), "c0st": u(60), "c1st": u(64), "grant": u(68),
             "trans": u(72), "walks": u(76), "faults": u(80), "cr2": u(84),
+        }
+
+    def read_perf(self):
+        """CPI-report counters: instructions retired, the eight stall-cause cycle
+        buckets, BTB correct/mispredicted, and the running U/V pair count."""
+        u = lambda off: struct.unpack_from("<I", self.mm, PERF + off)[0]
+        stalls = [u(4 + 4 * i) for i in range(8)]   # 0 none .. 7 halted
+        return {
+            "instret": u(0),
+            "stalls": stalls,
+            "btb_ok": u(36), "btb_bad": u(40), "pairs": u(44),
+            # active machine configuration (see host_config)
+            "dual": u(48), "serial": u(52), "btb_on": u(56), "cache_on": u(60),
+            "sets": u(64), "ways": u(68), "line": u(72),
         }
 
 
@@ -522,7 +537,7 @@ def line_of(listing, eip):
 WINKEYS = {ord('p'): ("pipe", "pipeline"), ord('m'): ("mem", "RAM"),
            ord('v'): ("vram", "video"),    ord('w'): ("wave", "chrono"),
            ord('k'): ("cache", "cache"),   ord('t'): ("tlb", "TLB"),
-           ord('b'): ("btb", "BTB")}
+           ord('b'): ("btb", "BTB"),       ord('r'): ("cpi", "CPI report")}
 
 
 def open_window(mode, build):
@@ -658,8 +673,9 @@ def code_view(scr, sh, build, snap):
             put(scr, top_y, 1, f"(no listing at {lst_path})", curses.color_pair(7))
         put_wrapped(scr, h - 1,
             "OPEN WINDOW:  p pipeline  m RAM  v video  w chrono  k cache  t TLB  b BTB"
-            "        s step  c continue  space pause  o Surfer  Up/Dn PgUp/PgDn scroll  "
-            "e follow EIP  +/- or Left/Right speed  q quit", curses.A_DIM)
+            "  r CPI report        s step  c continue  space pause  o Surfer  "
+            "Up/Dn PgUp/PgDn scroll  e follow EIP  +/- or Left/Right speed  q quit",
+            curses.A_DIM)
         snap.draw(scr)
         scr.refresh()
 
@@ -1216,6 +1232,212 @@ def btb_view(scr, sh, snap, core=0, title=None):
         speed_keys(c, sh, s)
 
 
+# ------------------------------------------------------------------- CPI report
+# Pentium (P54C) reference cycle counts per instruction, so students can read a
+# program as a cost breakdown.  These are the published P54C integer latencies;
+# the *measured* throughput also depends on U/V pairing, cache hits, and branch
+# prediction, which the pipeline / cache / BTB windows show live.
+def cpi_classify(src):
+    """One disassembled Intel-syntax line -> (cycles, pipe, note), or None for a
+    label/comment line.  `pipe` is 'U/V' (pairable, issues in either integer
+    pipe) or 'U' (complex op: U-pipe only, cannot co-issue)."""
+    s = src.split(";")[0].strip()
+    if not s:
+        return None
+    parts = s.split(None, 1)
+    mn = parts[0].lower()
+    ops = parts[1] if len(parts) > 1 else ""
+    first = ops.split(",")[0]
+    mem     = "[" in ops and mn != "lea"            # touches memory
+    mem_dst = "[" in first and mn != "lea"          # memory is the destination
+
+    if mn == "imul":  return (10, "U", "integer multiply (~10 cycles)")
+    if mn == "mul":   return (11, "U", "unsigned multiply -> EDX:EAX (~11)")
+    if mn == "div":   return (41, "U", "unsigned divide (~41 cycles!)")
+    if mn == "idiv":  return (46, "U", "signed divide (~46 cycles!)")
+    if mn in ("movsx", "movzx"): return (3, "U", "sign/zero-extend (~3)")
+    if mn == "cdq":   return (2, "U", "sign-extend EAX into EDX:EAX")
+    if mn == "cwde":  return (3, "U", "sign-extend AX into EAX")
+    if mn in ("shl", "shr", "sar", "sal", "rol", "ror", "rcl", "rcr"):
+        return (3, "U", "shift/rotate RMW memory") if mem else (1, "U", "shift/rotate")
+    if mn == "lea":   return (1, "U/V", "address calc, no memory access")
+    if mn == "call":  return (1, "U", "call (pushes return address)")
+    if mn in ("ret", "retn"):  return (1, "U", "return (predicted by BTB)")
+    if mn == "jmp":   return (1, "V", "jump")
+    if mn == "leave": return (3, "U", "ESP<-EBP, pop EBP")
+    if mn == "hlt":   return (1, "U", "halt until interrupt")
+    if mn == "nop" or (mn == "xchg" and ops.replace(" ", "") == "ax,ax"):
+        return (1, "U/V", "no-op (alignment pad)")
+    if mn in ("push", "pop"):  return (1, "U/V", mn + " (stack)")
+    if re.fullmatch(r"set[a-z]{1,3}", mn):  return (1, "U", "set byte on condition")
+    if mn.startswith("j"):     # jcc
+        return (1, "V", "cond jump: 1 if predicted, +3 if mispredicted")
+    if mn == "mov":
+        return (1, "U/V", "load/store (1 cyc on L1 hit)") if mem else \
+               (1, "U/V", "register/immediate move")
+    if mn in ("add", "or", "adc", "sbb", "and", "sub", "xor", "cmp", "test",
+              "inc", "dec", "neg", "not", "xchg"):
+        if mem_dst: return (3, "U", "read-modify-write memory (~3)")
+        if mem:     return (2, "U", "ALU, memory source (~2)")
+        return (1, "U/V", "ALU register op")
+    return (1, "U", "")                              # any other single-cycle op
+
+
+STALL_ROWS = [("useful work", "a retired instruction, no bubble"),
+              ("microcode",   "multi-cycle EX: MUL/IMUL/DIV, string, ..."),
+              ("AGI",         "address-generation interlock"),
+              ("branch",      "mispredict: flush + refetch"),
+              ("queue-empty", "front-end starved (I-fetch miss / drain)"),
+              ("mem-wait",    "data cache-miss line fills"),
+              ("bus-busy",    "bus owned by the other core"),
+              ("halted",      "HLT: waiting for an interrupt")]
+
+
+def cpi_view(scr, sh, build, snap):
+    """Live Pentium (P54C) performance report: measured instructions, cycles and
+    CPI; the stall breakdown by cause; U/V pairs issued; BTB accuracy; I/D cache
+    hit rates and data AMAT -- then a scrollable per-instruction P54C cost key.
+    All numbers are read straight from the core's hardware counters."""
+    lst_path = os.path.join(build, "pc_prog.lst")
+    listing, mtime, top = [], None, 0
+    rate = Rate()
+
+    def pct(n, d):
+        return (100.0 * n / d) if d else 0.0
+
+    while True:
+        if not sh.ready():
+            waiting(scr, sh)
+            if scr.getch() == ord('q'):
+                return
+            continue
+        sh.write32(112, int(time.time()))          # heartbeat
+        s  = sh.read()
+        sy = sh.read_sys()
+        pf = sh.read_perf()
+        try:
+            m = os.path.getmtime(lst_path)
+        except OSError:
+            m = None
+        if m != mtime:
+            listing, mtime = load_listing(lst_path), m
+        key_rows = [(a, src, cpi_classify(src) if a is not None else None)
+                    for a, _c, src in listing]
+
+        stalls  = pf["stalls"]
+        halt_c  = stalls[7]                        # cycles idling in HLT
+        pairs   = pf["pairs"]
+        # True dynamic instruction count = U-pipe retirements + the co-issued
+        # V-pipe partners (the single retire pulse per cycle counts a pair once).
+        # This makes the count -- and CPI -- identical whether or not the program
+        # dual-issues, so comparing PIPE=super vs scalar is apples-to-apples.
+        instret = pf["instret"] + pairs
+        # CPI and the breakdown use ACTIVE cycles (buckets 0..6) so a machine
+        # left spinning in HLT after the program ends does not inflate the CPI.
+        active  = sum(stalls[0:7]) or 1
+        cycles  = active
+        tot_st  = active
+        cpi     = active / instret if instret else 0.0
+        btot    = pf["btb_ok"] + pf["btb_bad"]
+        ic_a    = sy["ic_hits"] + sy["ic_miss"]
+        dc_a    = sy["dc_hits"] + sy["dc_miss"]
+        memwait = stalls[5]
+        amat    = 1.0 + (memwait / dc_a) if dc_a else 1.0
+        dmiss_r = pct(sy["dc_miss"], dc_a)
+        penalty = (memwait / sy["dc_miss"]) if sy["dc_miss"] else 0.0
+
+        h, w = scr.getmaxyx()
+        scr.erase()
+        G = curses.color_pair(6) | curses.A_BOLD
+        put(scr, 0, 0, (f" CPI REPORT -- live Pentium (P54C) performance    "
+                        f"cycle {s['cycle']:,}    "
+                        f"{speed_text(s, rate.update(s['cycle']))} ").ljust(w), curses.A_REVERSE)
+        y = 1
+        # Active machine configuration, so each report is self-labelled when
+        # students compare runs (make pc PROG=.. PIPE=.. CACHE=.. ...).
+        pipe = ("NON-PIPELINED" if pf["serial"] else
+                "SUPERSCALAR (U+V)" if pf["dual"] else "SCALAR (U only)")
+        cache_s = (f"L1 {pf['sets']}set x {pf['ways']}way x {pf['line']}w"
+                   if pf["cache_on"] else "NO CACHE")
+        btb_s = "BTB on" if pf["btb_on"] else "BTB OFF"
+        put(scr, y, 1, f"MACHINE: {pipe}   {btb_s}   {cache_s}",
+            curses.color_pair(4) | curses.A_BOLD); y += 1
+        idle = f"  (+{halt_c:,} idle in HLT)" if halt_c else ""
+        put(scr, y, 1, f"Instructions retired {instret:>11,}     "
+                       f"Active cycles {cycles:>9,}     CPI {cpi:6.2f}{idle}", curses.A_BOLD); y += 1
+        put(scr, y, 1, f"U/V pairs issued     {pairs:>11,}     "
+                       f"({pct(2 * pairs, instret):4.1f}% of retired instructions co-issued)"); y += 1
+        if btot:
+            put(scr, y, 1, f"BTB accuracy           {pct(pf['btb_ok'], btot):5.1f}%     "
+                           f"({pf['btb_ok']:,} correct / {pf['btb_bad']:,} mispredicted)")
+        else:
+            put(scr, y, 1, "BTB accuracy              n/a     (no branches resolved yet)")
+        y += 1
+        put(scr, y, 1, f"I-cache hit rate       {pct(sy['ic_hits'], ic_a):5.1f}%     "
+                       f"({sy['ic_hits']:,} hits / {sy['ic_miss']:,} miss)"); y += 1
+        put(scr, y, 1, f"D-cache hit rate       {pct(sy['dc_hits'], dc_a):5.1f}%     "
+                       f"({sy['dc_hits']:,} hits / {sy['dc_miss']:,} miss)"); y += 1
+        put(scr, y, 1, f"AMAT (data)            {amat:5.2f} cyc  "
+                       f"(hit 1 + miss-rate {dmiss_r:.1f}% x penalty {penalty:.1f} cyc)"); y += 1
+
+        y += 1
+        put(scr, y, 1, "where the active cycles go (measured stall breakdown):", G); y += 1
+        for i, (nm, note) in enumerate(STALL_ROWS[:7]):    # buckets 0..6; 7 (HLT) shown above
+            if y >= h - 2:
+                break
+            bar = "#" * int(round(18 * stalls[i] / tot_st))
+            put(scr, y, 3, (f"{nm:<12}{stalls[i]:>11,} {pct(stalls[i], tot_st):5.1f}%  "
+                            f"{bar:<18} {note}")[:w - 4],
+                curses.color_pair(5) if i == 0 else 0)
+            y += 1
+
+        y += 1
+        if y < h - 2:
+            put(scr, y, 1, "per-instruction P54C cost key (Up/Dn scroll):", G); y += 1
+        hdr_y = y
+        body = max(1, h - hdr_y - 1)
+        top = max(0, min(top, max(0, len(key_rows) - body)))
+        for r in range(body):
+            i = top + r
+            if i >= len(key_rows) or hdr_y + r >= h - 1:
+                break
+            a, src, info = key_rows[i]
+            yy = hdr_y + r
+            if info is None:
+                t = src.split(";")[0].strip()
+                if t:
+                    put(scr, yy, 3, t[:w - 4], curses.color_pair(8))
+                continue
+            cyc, pipe, note = info
+            txt = " ".join(src.split(";")[0].split())
+            line = f"{a:04X} {cyc:>3} {pipe:<3}  {txt}"
+            if a == s["eip"]:
+                attr = curses.color_pair(4) | curses.A_BOLD        # the EX line
+            elif cyc >= 10:
+                attr = curses.color_pair(7) | curses.A_BOLD        # expensive op
+            elif pipe == "U/V":
+                attr = curses.color_pair(5)                        # pairable
+            else:
+                attr = 0
+            put(scr, yy, 3, (line + (f"   {note}" if note else ""))[:w - 4], attr)
+
+        put_wrapped(scr, h - 1,
+            "Up/Dn PgUp/PgDn scroll   s step  c continue  space pause  q quit",
+            curses.A_DIM)
+        scr.refresh()
+
+        c = scr.getch()
+        if c == ord('q'):
+            return
+        if speed_keys(c, sh, s):
+            pass
+        elif c in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE,
+                   curses.KEY_HOME, curses.KEY_END):
+            top += {curses.KEY_UP: -1, curses.KEY_DOWN: 1, curses.KEY_PPAGE: -body,
+                    curses.KEY_NPAGE: body, curses.KEY_HOME: -10 ** 6,
+                    curses.KEY_END: 10 ** 6}[c]
+
+
 def main(scr):
     mode = sys.argv[1] if len(sys.argv) > 1 else "mem"
     build = sys.argv[2] if len(sys.argv) > 2 else os.path.join(
@@ -1246,6 +1468,8 @@ def main(scr):
         btb_view(scr, sh, snap)
     elif mode == "btb-ap":
         btb_view(scr, sh, snap, core=1, title="BTB (AP core 1)")
+    elif mode == "cpi":
+        cpi_view(scr, sh, build, snap)
     elif mode == "vram":
         mem_view(scr, sh, snap, vmode=True)
     else:
@@ -1255,7 +1479,7 @@ def main(scr):
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] not in (
             "mem", "vram", "code", "wave", "pipe", "pipe-ap", "cache", "tlb",
-            "btb", "btb-ap"):
+            "btb", "btb-ap", "cpi"):
         sys.exit(__doc__)
     locale.setlocale(locale.LC_ALL, "")      # so curses writes the UTF-8 glyphs (▔ ╳ ─)
     curses.wrapper(main)

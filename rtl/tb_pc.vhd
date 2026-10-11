@@ -52,7 +52,17 @@ entity tb_pc is
         RUN_TO       : integer := 0;       -- batch: stop at exactly this cycle
         MAX_CYCLES   : integer := 3000000;
         IDLE_CYCLES  : integer := 20000;
-        POLL_CYCLES  : integer := 200      -- live: poll the terminal this often
+        POLL_CYCLES  : integer := 200;     -- live: poll the terminal this often
+        -- Machine-configuration knobs (default = the standard Pentium machine;
+        -- overridden only when run_sim.sh passes them). Applied to BOTH cores and
+        -- the L1. See the README "Machine configuration" section.
+        CFG_DUAL     : boolean := true;    -- U/V dual-issue (false = scalar)
+        CFG_SERIAL   : boolean := false;   -- drain every instruction (no pipeline)
+        CFG_BTB      : boolean := true;    -- branch prediction on
+        CFG_CACHE    : boolean := true;    -- L1 on (false = no-cache, every access misses)
+        CFG_SETS     : integer := 4;       -- L1 sets (power of two)
+        CFG_WAYS     : integer := 2;       -- L1 associativity (power of two)
+        CFG_LINE     : integer := 8        -- L1 words per line (line = 4*CFG_LINE bytes)
     );
 end tb_pc;
 
@@ -99,6 +109,13 @@ architecture sim of tb_pc is
                        c0st, c1st, grant, trans, walks, faults, cr2 : integer) is
     begin assert false severity failure; end procedure;
     attribute foreign of host_sys : procedure is "VHPIDIRECT ./libpchost.so host_sys";
+    procedure host_perf(instret, s0, s1, s2, s3, s4, s5, s6, s7,
+                        btb_ok, btb_bad, pairs32 : integer) is
+    begin assert false severity failure; end procedure;
+    attribute foreign of host_perf : procedure is "VHPIDIRECT ./libpchost.so host_perf";
+    procedure host_config(dual, serial, btb, cache, sets, ways, line : integer) is
+    begin assert false severity failure; end procedure;
+    attribute foreign of host_config : procedure is "VHPIDIRECT ./libpchost.so host_config";
     procedure host_wave_ap(cycle, eip, d1, d2, ex, wb, q1, q2, qe, qw,
                            valid, stl, pq, s0, s1, s2,
                            v_eip, v_seq, v_valid : integer) is
@@ -217,6 +234,8 @@ architecture sim of tb_pc is
     signal ap_v_seq    : std_logic_vector(15 downto 0);
     signal ap_v_eip    : std_logic_vector(31 downto 0);
     signal bsp_pairs   : std_logic_vector(15 downto 0);
+    signal bsp_pairs32 : std_logic_vector(31 downto 0);
+    signal bsp_btb_ok, bsp_btb_bad : std_logic_vector(31 downto 0);
     -- AP (core 1) pipeline taps, so the AP gets its own live pipeline chart.
     signal ap_d1_eip, ap_d2_eip, ap_ex_eip, ap_wb_eip : std_logic_vector(31 downto 0);
     signal ap_d1_seq, ap_d2_seq, ap_ex_seq, ap_wb_seq : std_logic_vector(15 downto 0);
@@ -321,7 +340,8 @@ begin
     -- CPU
     ----------------------------------------------------------------------------
     cpu_inst : entity work.x86_cpu
-        generic map (DISASM_FILE => disasm_file)
+        generic map (DISASM_FILE => disasm_file,
+                     DUAL_ISSUE => CFG_DUAL, SERIALIZE => CFG_SERIAL, BTB_ENABLE => CFG_BTB)
         port map (
             clk => dbg01_clk, reset => reset,
             data_in => cpu_din, ready => cpu_ready,
@@ -347,7 +367,8 @@ begin
             dbg_v_valid => bsp_v_valid, dbg_v_seq => bsp_v_seq, dbg_v_eip => bsp_v_eip,
             dbg_pairs => bsp_pairs,
             dbg_state_name => dbg_state_name,
-            dbg_btb_tag => bsp_btb_tag, dbg_btb_tgt => bsp_btb_tgt, dbg_btb_meta => bsp_btb_meta
+            dbg_btb_tag => bsp_btb_tag, dbg_btb_tgt => bsp_btb_tgt, dbg_btb_meta => bsp_btb_meta,
+            dbg_btb_correct => bsp_btb_ok, dbg_btb_wrong => bsp_btb_bad, dbg_pairs32 => bsp_pairs32
         );
 
     -- BSP MMU: translates the CPU's virtual bus to the physical bus that drives
@@ -415,7 +436,9 @@ begin
     -- uncacheable and come out of the mmio port to the chipset + VGA below.
     ----------------------------------------------------------------------------
     mem : entity work.l1_mesi
-        generic map (init_file => program_file, RAM_BITS => RAM_BITS)
+        generic map (init_file => program_file, RAM_BITS => RAM_BITS,
+                     N_SETS => CFG_SETS, N_WAYS => CFG_WAYS, LINE_WORDS => CFG_LINE,
+                     CACHE_ON => CFG_CACHE)
         port map (
             clk => dbg01_clk, reset => reset,
             a0_addr => p0_addr, a0_din => p0_wr, a0_dout => p0_rd,
@@ -446,7 +469,8 @@ begin
     -- Application processor: boots parked, started by the BSP's SIPI. It has no
     -- device I/O and takes no device interrupts (those go to the BSP).
     ap : entity work.x86_cpu
-        generic map (AP_PARK => true)
+        generic map (AP_PARK => true,
+                     DUAL_ISSUE => CFG_DUAL, SERIALIZE => CFG_SERIAL, BTB_ENABLE => CFG_BTB)
         port map (
             clk => dbg01_clk, reset => reset, wake => ap_wake, wake_eip => ap_wake_eip,
             data_in => a1_rd, ready => a1_ready,
@@ -672,6 +696,15 @@ begin
                         to_integer(unsigned(c0_mstate)), to_integer(unsigned(c1_mstate)),
                         to_integer(unsigned(cache_grant)),
                         bits(p_trans), bits(p_walks), bits(p_flts), bits(fault_addr));
+                    -- CPI-report counters: retired count, the 8 stall-cause
+                    -- cycle buckets, BTB correct/wrong, and the 32-bit pair count.
+                    host_perf(instret,
+                        stall_cnt(0), stall_cnt(1), stall_cnt(2), stall_cnt(3),
+                        stall_cnt(4), stall_cnt(5), stall_cnt(6), stall_cnt(7),
+                        bits(bsp_btb_ok), bits(bsp_btb_bad), bits(bsp_pairs32));
+                    host_config(boolean'pos(CFG_DUAL), boolean'pos(CFG_SERIAL),
+                        boolean'pos(CFG_BTB), boolean'pos(CFG_CACHE),
+                        CFG_SETS, CFG_WAYS, CFG_LINE);
                     if host_cache_wanted = 1 then
                         for i in 0 to 63 loop
                             host_cache(i*4,       bits_x(dcache_dat(32*i+31 downto 32*i)));
@@ -896,6 +929,9 @@ begin
                "   D-cache hits/misses = " & integer'image(to_integer(unsigned(dc_hits))) &
                " / " & integer'image(to_integer(unsigned(dc_misses))) &
                "   write-backs = " & integer'image(to_integer(unsigned(cache_wb)));
+        report "Superscalar: U/V pairs issued = " & integer'image(to_integer(unsigned(bsp_pairs32))) &
+               "   BTB predictions: correct = " & integer'image(to_integer(unsigned(bsp_btb_ok))) &
+               " / mispredicted = " & integer'image(to_integer(unsigned(bsp_btb_bad)));
         report "Paging (BSP): TLB translations = " & integer'image(to_integer(unsigned(p_trans))) &
                "   page-table walks = " & integer'image(to_integer(unsigned(p_walks))) &
                "   page faults = " & integer'image(to_integer(unsigned(p_flts)));

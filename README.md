@@ -1,32 +1,16 @@
 # Dual-Pentium (P54C) Teaching Computer — VHDL
 
-A genuinely **x86-32 (IA-32)** machine in VHDL that executes **real x86 machine code** — every program is assembled with `nasm` and disassembles with `ndisasm` / `objdump -b binary -m i386`, so you write real x86, see the real bytes, and the hardware runs them. The microarchitecture is a faithful (scaled) **Intel Pentium**, built to Alpert & Avnon's *"Architecture of the Pentium Microprocessor"* (IEEE Micro, 1993) — the paper students read alongside it.
+An x86-32 (IA-32) machine in VHDL that runs **real x86 machine code**: programs are assembled with `nasm`, or compiled from C with `gcc -m32` at `-O0`/`-O2`, and the hardware executes the actual bytes. The microarchitecture is a faithful, scaled **Intel Pentium (P54C)**, built to Alpert & Avnon's *"Architecture of the Pentium Microprocessor"* (IEEE Micro, 1993) — a two-core SMP machine with caches on by default; a single-threaded program runs on the bootstrap core with the other parked.
 
-- **Superscalar P5 core** — two integer pipelines (**U** and **V**) that issue two instructions per clock under the paper's Figure-5 rule, a **branch target buffer** (2-bit predictor, predict-at-decode with speculative fetch), and the five-stage integer pipe. `cmp`/`dec` + `Jcc` pair with same-cycle flag forwarding.
-- **Separate instruction and data caches** — each 2-way set-associative, 32-byte lines, write-back; **self-/cross-modifying code** is kept coherent by snooping the instruction cache.
-- **Dual processor (P54C)** — two cores sharing one bus, their data caches kept coherent by **snooping MESI**, with a sticky `LOCK#` for atomic `LOCK CMPXCHG`. The core is the P5; glueless two-way SMP and the on-chip local APIC are the P54C additions.
-- **APIC / SIPI bring-up** — the bootstrap processor (BSP) runs from reset; the application processor (AP) boots parked and is started the real way: the BSP writes the local-APIC ICR with an **INIT** then a **STARTUP IPI** carrying a start vector.
-- **Scaled x86 paging** — each core has its own **MMU + TLB** (single-level page table, `#PF`); the L1 is **physically tagged** (translate, then cache).
-- **Teaching PC** (`make pc`) — the machine in an IBM PC/AT: real 8259 PICs, an 8042 keyboard, a VGA text screen (uncacheable video RAM, as on real hardware), and an ATA disk, wired to your terminal as a live screen and keyboard.
-- Correctness is machine-checked: `check_tests.py` verifies final registers/flags/memory, and `verify_cache.py` cross-checks the cache against an independent reference model.
+- **Superscalar P5 core** — U and V integer pipes issue two instructions per clock, a 2-bit branch-target buffer predicts at decode with speculative fetch, over a five-stage pipe (PF D1 D2 EX WB).
+- **Split write-back L1** — separate 2-way, 32-byte-line instruction and data caches; self-/cross-modifying code stays coherent by snooping the I-cache.
+- **Dual-core P54C SMP** — snooping **MESI** keeps the data caches coherent, a sticky `LOCK#` makes `LOCK CMPXCHG` atomic, and the application core is started the real way (local-APIC **INIT + STARTUP IPI**).
+- **Scaled paging** — each core has its own MMU + TLB (single-level page table, `#PF`); the physically-tagged L1 translates, then caches.
+- **Teaching PC** — real 8259 PICs, an 8042 keyboard, a VGA text screen, and an ATA disk, wired to your terminal as a live screen and keyboard.
+- **gcc-ready integer ISA** — real encodings including SIB scaled-index addressing, memory-operand and byte ALU, `IMUL`/`MUL`/`DIV`/`IDIV` (multi-cycle), shifts, `LEA`, `MOVSX`/`MOVZX`, `SETcc`, `IN`/`OUT`, SSE2 `MOVAPS`/`PADDD`; anything unimplemented raises `#UD`.
+- **Live CPI report** (press `r`) — measured instructions, CPI, stall breakdown by cause, U/V pairs, BTB accuracy, cache hit rates, and data AMAT, all read from the core's own hardware counters.
 
-Everything is **one core design** (the Pentium) in a **two-CPU SMP configuration with caches on by default**; a single-threaded program simply runs on the BSP with the AP parked. The ISA covers the real encodings of MOV/ALU/shifts/stack/branches/`CALL`/`INT`/`IRET`, `IN`/`OUT`, SSE2 (`MOVAPS`/`PADDD`), `LOCK CMPXCHG`, and the paging control-register moves — anything else raises `#UD`.
-
-## Requirements
-
-Linux with `nasm`, `ghdl`, `gcc`, and `surfer` — `make` installs whatever is missing.
-
-## Usage
-
-```
-make                 # assemble + simulate every test on the dual-Pentium, then
-                     #   check results and cross-check the cache
-make run TEST=07     # build one test and open its waveform in Surfer
-make smp             # SMP demo: the BSP starts the AP by SIPI; both contend on
-                     #   a LOCK CMPXCHG spinlock (MESI coherency, no lost updates)
-make vm              # scaled x86 paging suite (TLB, demand paging, #PF)
-make pc              # LIVE teaching PC: type at the keyboard, see the screen
-```
+`make` builds and machine-checks the whole machine in one command — the ALU/cache suite (with an independent cache cross-check via `verify_cache.py`), paging, SMP coherency, the PC devices, and gcc-compiled C at `-O0`/`-O2`; `check_tests.py` verifies final registers, flags, and memory. `make pc [PROG=asm/x.asm|c/x.c] [OPT=-O0|-O2]` runs one program live with on-demand viewer windows (`p` pipeline, `m` RAM, `k` cache, `b` BTB, `w` chronogram, `r` CPI report, …), and `make pc smp` opens both cores. Append machine-configuration knobs — `PIPE=super|scalar|none`, `BTB=0|1`, `CACHE=0|1`, and `DSETS=`/`DWAYS=`/`DLINE=` for L1 geometry — to change one thing and watch the CPI report move (the defaults *are* the standard machine, so plain `make pc` is unchanged); `make cpi-compare PROG=…` tabulates one program across all of them side by side. Needs Linux with `nasm`, `ghdl`, and `gcc` (`make` installs any that are missing; `surfer` is optional, for waveform snapshots).
 
 ---
 

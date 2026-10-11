@@ -43,8 +43,16 @@ use STD.TEXTIO.ALL;
 entity l1_mesi is
     generic (
         init_file : string  := "";
-        RAM_BITS  : integer := 9       -- cacheable RAM size = 2**RAM_BITS bytes
+        RAM_BITS  : integer := 9;      -- cacheable RAM size = 2**RAM_BITS bytes
                                        -- (9 = 512 B default; the PC uses 12 = 4 KB)
+        -- Teaching knobs (default = the real Pentium split L1: 2-way, 4 sets,
+        -- 32-byte lines; see the README). N_SETS/N_WAYS/LINE_WORDS must be powers
+        -- of two. CACHE_ON=false = no-allocate write-through: every access misses
+        -- to memory (0% hit rate), so students can contrast "cache vs no cache".
+        N_SETS     : integer := 4;
+        N_WAYS     : integer := 2;
+        LINE_WORDS : integer := 8;     -- 32-bit words per line (line = 4*LINE_WORDS B)
+        CACHE_ON   : boolean := true
     );
     port (
         clk   : in  std_logic;
@@ -126,13 +134,28 @@ end l1_mesi;
 
 architecture behavioral of l1_mesi is
 
-    constant SETS  : integer := 4;
-    constant WAYS  : integer := 2;
-    constant WORDS : integer := 8;       -- 32-byte line (bits [4:2] = word, [6:5] = set)
+    constant SETS  : integer := N_SETS;
+    constant WAYS  : integer := N_WAYS;
+    constant WORDS : integer := LINE_WORDS;
 
-    -- The tag is addr[RAM_BITS-1 : 7]; the cacheable RAM is 2**RAM_BITS bytes
-    -- (= 2**(RAM_BITS-2) 32-bit words). Addresses above that are uncacheable MMIO.
-    constant TAG_BITS : integer := RAM_BITS - 7;
+    function clog2(n : integer) return integer is
+        variable r : integer := 0;  variable v : integer := 1;
+    begin
+        while v < n loop v := v * 2; r := r + 1; end loop;
+        return r;                        -- 0 for n = 1
+    end function;
+
+    -- Address layout (little-endian word addressing), derived from the geometry:
+    --   [1:0] byte | [OFFB-1:2] word in line | [IDXB-1:OFFB] set index | [..:IDXB] tag
+    -- Default (8 words, 4 sets): word=[4:2], set=[6:5], tag=[RAM_BITS-1:7].
+    constant WBITS : integer := clog2(WORDS);
+    constant SBITS : integer := clog2(SETS);
+    constant OFFB  : integer := 2 + WBITS;           -- first set-index bit
+    constant IDXB  : integer := OFFB + SBITS;         -- first tag bit
+
+    -- The cacheable RAM is 2**RAM_BITS bytes (= 2**(RAM_BITS-2) 32-bit words).
+    -- Addresses at/above that are uncacheable MMIO.
+    constant TAG_BITS : integer := RAM_BITS - IDXB;
     constant RAM_WORDS : integer := 2 ** (RAM_BITS - 2);
 
     constant ST_I : std_logic_vector(1 downto 0) := "00";
@@ -233,14 +256,16 @@ architecture behavioral of l1_mesi is
     signal f_victim : integer range 0 to WAYS - 1 := 0;
     signal burst_w  : integer range 0 to WORDS - 1 := 0;   -- current line-fill/writeback beat
 
+    -- Null slices (e.g. SETS=1 -> SBITS=0) make to_integer return 0, so these
+    -- stay correct at the degenerate geometries used for the "no cache" knob.
     function set_of(a : std_logic_vector(31 downto 0)) return integer is
-    begin return to_integer(unsigned(a(6 downto 5))); end function;
+    begin return to_integer(unsigned(a(IDXB - 1 downto OFFB))); end function;
     function tag_of(a : std_logic_vector(31 downto 0)) return std_logic_vector is
-    begin return a(RAM_BITS - 1 downto 7); end function;
+    begin return a(RAM_BITS - 1 downto IDXB); end function;
     function word_of(a : std_logic_vector(31 downto 0)) return integer is
-    begin return to_integer(unsigned(a(4 downto 2))); end function;
+    begin return to_integer(unsigned(a(OFFB - 1 downto 2))); end function;
     function ramword(tg : std_logic_vector(TAG_BITS - 1 downto 0); se : integer; w : integer) return integer is
-    begin return to_integer(unsigned(tg)) * 32 + se * 8 + w; end function;
+    begin return to_integer(unsigned(tg)) * (SETS * WORDS) + se * WORDS + w; end function;
     -- Uncacheable: an address outside the cacheable RAM window (>= 2**RAM_BITS).
     function is_uc(a : std_logic_vector(31 downto 0)) return boolean is
     begin return unsigned(a(31 downto RAM_BITS)) /= 0; end function;
@@ -265,6 +290,7 @@ architecture behavioral of l1_mesi is
         -- report "miss" rather than compare metavalue tags (this lookup runs
         -- combinationally every cycle for both cores).
         if is_x(a) then hit := '0'; way := 0; return; end if;
+        if not CACHE_ON then hit := '0'; way := 0; return; end if;  -- no-cache: always miss
         se := set_of(a); tg := tag_of(a);
         for k in 0 to WAYS - 1 loop
             if ifetch = '1' then
@@ -379,6 +405,7 @@ begin
         variable oa  : integer range 0 to WAYS - 1;
         variable dj_hit, di_hit : std_logic;
         variable dj_way, di_way : integer range 0 to WAYS - 1;
+        variable mw  : std_logic_vector(31 downto 0);   -- merged store word (no-cache write-through)
 
         -- LRU touch (data cache)
         procedure touch_d(c, s2, wy : integer) is
@@ -548,8 +575,10 @@ begin
                             i_dat(i, se, f_victim)(burst_w) <= ram(ramword(tg, se, burst_w));
                         end if;
                         if burst_w = WORDS - 1 then
-                            i_tag(i, se, f_victim) <= tg;
-                            i_v(i, se, f_victim)   <= ST_S;    -- valid (I-cache uses only I vs non-I)
+                            if CACHE_ON then                   -- no-cache: fill but don't retain
+                                i_tag(i, se, f_victim) <= tg;
+                                i_v(i, se, f_victim)   <= ST_S; -- valid (I-cache uses only I vs non-I)
+                            end if;
                             burst_w <= 0;
                             cstatem <= C_SERVE;
                         else
@@ -577,10 +606,12 @@ begin
                                     d_st(j, se, dj_way) <= ST_S;
                                 end if;
                             end if;
-                            d_tag(i, se, f_victim) <= tg;
-                            if f_we = '1' then         d_st(i, se, f_victim) <= ST_M;   -- will write in C_SERVE
-                            elsif dj_hit = '1' then    d_st(i, se, f_victim) <= ST_S;   -- shared with other
-                            else                       d_st(i, se, f_victim) <= ST_E;   -- exclusive
+                            if CACHE_ON then           -- no-cache: fill but don't retain the line
+                                d_tag(i, se, f_victim) <= tg;
+                                if f_we = '1' then         d_st(i, se, f_victim) <= ST_M;   -- will write in C_SERVE
+                                elsif dj_hit = '1' then    d_st(i, se, f_victim) <= ST_S;   -- shared with other
+                                else                       d_st(i, se, f_victim) <= ST_E;   -- exclusive
+                                end if;
                             end if;
                             burst_w <= 0;
                             cstatem <= C_SERVE;
@@ -598,12 +629,18 @@ begin
                     else
                         if i = 0 then c0_dm <= c0_dm + 1; else c1_dm <= c1_dm + 1; end if;
                         if f_we = '1' then                     -- apply the store into the filled line
-                            if f_be(0) = '1' then d_dat(i, se, f_victim)(wd)(7 downto 0)   <= f_din(7 downto 0);   end if;
-                            if f_be(1) = '1' then d_dat(i, se, f_victim)(wd)(15 downto 8)  <= f_din(15 downto 8);  end if;
-                            if f_be(2) = '1' then d_dat(i, se, f_victim)(wd)(23 downto 16) <= f_din(23 downto 16); end if;
-                            if f_be(3) = '1' then d_dat(i, se, f_victim)(wd)(31 downto 24) <= f_din(31 downto 24); end if;
-                            d_st(i, se, f_victim) <= ST_M;
-                            smc_snoop(se, tg);                 -- SMC: a store may hit cached code
+                            mw := d_dat(i, se, f_victim)(wd);  -- old word (just filled from RAM)
+                            if f_be(0) = '1' then mw(7 downto 0)   := f_din(7 downto 0);   end if;
+                            if f_be(1) = '1' then mw(15 downto 8)  := f_din(15 downto 8);  end if;
+                            if f_be(2) = '1' then mw(23 downto 16) := f_din(23 downto 16); end if;
+                            if f_be(3) = '1' then mw(31 downto 24) := f_din(31 downto 24); end if;
+                            d_dat(i, se, f_victim)(wd) <= mw;
+                            if CACHE_ON then
+                                d_st(i, se, f_victim) <= ST_M;
+                                smc_snoop(se, tg);             -- SMC: a store may hit cached code
+                            else
+                                ram(ramword(tg, se, wd)) <= mw;  -- no-cache: write through, no allocate
+                            end if;
                         end if;
                         touch_d(i, se, f_victim);
                     end if;
@@ -626,17 +663,24 @@ begin
     cache_view_proc : process(all)
         variable ln : integer;
     begin
+        -- The viewer vectors hold the default geometry (64 words / 8 lines); for
+        -- a larger configured cache, flatten only what fits (the window shows the
+        -- first lines) so we never index past the fixed debug ports.
         for s in 0 to SETS - 1 loop
             for w in 0 to WAYS - 1 loop
                 ln := s * WAYS + w;
                 for k in 0 to WORDS - 1 loop
-                    dbg_dcache(32*(ln*WORDS + k) + 31 downto 32*(ln*WORDS + k)) <= d_dat(0, s, w)(k);
-                    dbg_icache(32*(ln*WORDS + k) + 31 downto 32*(ln*WORDS + k)) <= i_dat(0, s, w)(k);
+                    if ln * WORDS + k < 64 then
+                        dbg_dcache(32*(ln*WORDS + k) + 31 downto 32*(ln*WORDS + k)) <= d_dat(0, s, w)(k);
+                        dbg_icache(32*(ln*WORDS + k) + 31 downto 32*(ln*WORDS + k)) <= i_dat(0, s, w)(k);
+                    end if;
                 end loop;
-                dbg_dmeta(8*ln + 1 downto 8*ln)     <= d_st(0, s, w);                -- MESI state
-                dbg_dmeta(8*ln + 7 downto 8*ln + 2) <= std_logic_vector(resize(unsigned(d_tag(0, s, w)), 6));
-                dbg_imeta(8*ln + 1 downto 8*ln)     <= i_v(0, s, w);                 -- valid (ST_I = empty)
-                dbg_imeta(8*ln + 7 downto 8*ln + 2) <= std_logic_vector(resize(unsigned(i_tag(0, s, w)), 6));
+                if ln < 8 then
+                    dbg_dmeta(8*ln + 1 downto 8*ln)     <= d_st(0, s, w);            -- MESI state
+                    dbg_dmeta(8*ln + 7 downto 8*ln + 2) <= std_logic_vector(resize(unsigned(d_tag(0, s, w)), 6));
+                    dbg_imeta(8*ln + 1 downto 8*ln)     <= i_v(0, s, w);             -- valid (ST_I = empty)
+                    dbg_imeta(8*ln + 7 downto 8*ln + 2) <= std_logic_vector(resize(unsigned(i_tag(0, s, w)), 6));
+                end if;
             end loop;
         end loop;
     end process;
