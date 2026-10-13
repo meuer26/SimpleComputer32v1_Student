@@ -157,6 +157,7 @@ architecture sim of tb_pc is
     signal dbg_state_name     : std_logic_vector(8*16-1 downto 0);
     signal dbg_pc             : std_logic_vector(31 downto 0);
     signal dbg_cr3            : std_logic_vector(31 downto 0);
+    signal dbg_cr2            : std_logic_vector(31 downto 0);   -- latched #PF address (CR2)
     signal dbg_vector         : std_logic_vector(7 downto 0);
     signal ud_fault           : std_logic;
     -- pipeline view (CORE=pipe; on the multi-cycle core only EX is used)
@@ -359,7 +360,8 @@ begin
             dbg_esi => dbg_esi, dbg_edi => dbg_edi,
             dbg09_flags => dbg09_flags, dbg_eflags => dbg_eflags, dbg10_ivt => dbg10_ivt,
             dbg13_xchg_active => dbg13_xchg_active,
-            dbg_pc => dbg_pc, dbg_cr3 => dbg_cr3, dbg_ud => ud_fault, dbg_vector => dbg_vector,
+            dbg_pc => dbg_pc, dbg_cr3 => dbg_cr3, dbg_cr2 => dbg_cr2,
+            dbg_ud => ud_fault, dbg_vector => dbg_vector,
             dbg_retire => retire, dbg_boundary => boundary, dbg_stall => stall,
             dbg_pq_cnt => pq_cnt, dbg_pf_addr => pf_addr, dbg_stage_valid => stage_valid,
             dbg_d1_eip => d1_eip, dbg_d2_eip => d2_eip, dbg_ex_eip => ex_eip, dbg_wb_eip => wb_eip,
@@ -695,7 +697,7 @@ begin
                         bits(cache_inval), bits(cache_wb),
                         to_integer(unsigned(c0_mstate)), to_integer(unsigned(c1_mstate)),
                         to_integer(unsigned(cache_grant)),
-                        bits(p_trans), bits(p_walks), bits(p_flts), bits(fault_addr));
+                        bits(p_trans), bits(p_walks), bits(p_flts), bits(dbg_cr2));
                     -- CPI-report counters: retired count, the 8 stall-cause
                     -- cycle buckets, BTB correct/wrong, and the 32-bit pair count.
                     host_perf(instret,

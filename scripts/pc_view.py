@@ -1147,9 +1147,9 @@ def cache_view(scr, sh, snap):
 
 
 def tlb_view(scr, sh, snap):
-    """The MMU: CR3/CR2 and the TLB. Walks stay low while translations climb --
-    that gap is the TLB caching page-table lookups (paging is idle until a
-    program sets CR0.PG)."""
+    """The MMU: CR3/CR2 and the TLB. A TLB miss walks TWO levels (page directory
+    then page table = two memory reads); walks stay low while translations climb
+    -- that gap is the TLB caching those walks (paging is idle until CR0.PG)."""
     rate = Rate()
     while True:
         if not sh.ready():
@@ -1160,16 +1160,19 @@ def tlb_view(scr, sh, snap):
         s = sh.read(); sy = sh.read_sys()
         h, w = scr.getmaxyx()
         scr.erase()
-        put(scr, 0, 0, (" MMU / TLB  scaled x86 paging: 64-byte pages, CR3 page table, 4-entry TLB   "
-                        f"{speed_text(s, rate.update(s['cycle']))} ").ljust(w), curses.A_REVERSE)
+        put(scr, 0, 0, (" MMU / TLB  scaled x86 two-level paging: 64-byte pages, page dir -> page "
+                        f"table, 4-entry TLB   {speed_text(s, rate.update(s['cycle']))} ").ljust(w),
+            curses.A_REVERSE)
         banner(scr, s)
-        put(scr, 2, 2, f"CR3 (page-table base) : 0x{s['cr3']:08X}")
-        put(scr, 3, 2, f"CR2 (last fault addr) : 0x{sy['cr2']:08X}")
+        put(scr, 2, 2, f"CR3 (page-directory base) : 0x{s['cr3']:08X}")
+        put(scr, 3, 2, f"CR2 (last #PF address)    : 0x{sy['cr2']:08X}")
         put(scr, 5, 2, f"TLB translations : {sy['trans']:>9}   (one per paged access)", curses.color_pair(6))
-        put(scr, 6, 2, f"page-table walks : {sy['walks']:>9}   (only on a TLB miss)", curses.color_pair(4) | curses.A_BOLD)
-        put(scr, 7, 2, f"page faults #PF  : {sy['faults']:>9}", curses.color_pair(9) | curses.A_BOLD)
-        put(scr, 9, 2, "Paging is OFF until a program sets CR0.PG. Once on, the walk")
-        put(scr, 10, 2, "count stays low while translations climb -- the TLB at work.")
+        put(scr, 6, 2, f"page-table walks : {sy['walks']:>9}   (TLB miss; 2 reads each: PDE+PTE)",
+            curses.color_pair(4) | curses.A_BOLD)
+        put(scr, 7, 2, f"page faults #PF  : {sy['faults']:>9}   (not-present PDE or PTE; see CR2 above)",
+            curses.color_pair(9) | curses.A_BOLD)
+        put(scr, 9, 2, "Paging is OFF until a program sets CR0.PG. Once on, a miss walks")
+        put(scr, 10, 2, "CR3 -> page directory -> page table (two reads); the TLB caches the result.")
         put(scr, h - 1, 0, " q quit   +/- speed   s step   c run ".ljust(w), curses.A_REVERSE)
         scr.refresh()
         c = scr.getch()
