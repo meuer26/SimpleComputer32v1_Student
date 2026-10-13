@@ -890,6 +890,15 @@ begin
         reset <= '0';
 
         wait until stop_req;
+        -- A bounded (RUN_TO) run is a waveform snapshot: freeze the clock at the
+        -- requested cycle right now, so the VCD stops exactly there. The text
+        -- report + screen/memory dump below step `dump_addr` with `wait for 1 ns`
+        -- for thousands of ns, during which the clock would otherwise keep
+        -- ticking and record the rest of the program past the paused cycle.
+        if RUN_TO > 0 then
+            sim_done <= true;
+            wait;
+        end if;
         wait for CLK_PERIOD;
         if LIVE = 1 then host_close; end if;
 
