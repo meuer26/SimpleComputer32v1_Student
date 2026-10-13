@@ -240,6 +240,7 @@ check-tools: check-llvm
 	@missing=""; \
 	 command -v nasm >/dev/null 2>&1 || missing="$$missing nasm"; \
 	 command -v ghdl >/dev/null 2>&1 || missing="$$missing ghdl-llvm"; \
+	 command -v ghdl-mcode >/dev/null 2>&1 || missing="$$missing ghdl-mcode"; \
 	 if [ -n "$$missing" ]; then \
 	   [ -n "$(APT)" ] || { echo "ERROR: apt-get not found. Install$$missing manually, then re-run make."; exit 1; }; \
 	   echo ">> Installing:$$missing   (sudo may prompt for your password)"; \
@@ -254,14 +255,21 @@ check-tools: check-llvm
 check-llvm:
 	@command -v ghdl-llvm >/dev/null 2>&1 || exit 0; \
 	 ghdl-llvm --version >/dev/null 2>&1 && exit 0; \
-	 need=$$(ghdl-llvm --version 2>&1 | grep -oE 'libLLVM-[0-9.]+\.so\.[0-9.]+' | head -1); \
-	 real=$$(ldconfig -p | grep -oE '/[^ ]*/libLLVM\.so\.[0-9.]+' | head -1); \
-	 [ -n "$$need" ] && [ -n "$$real" ] || exit 0; \
-	 dir=$$(dirname "$$real"); \
-	 echo ">> Enabling the LLVM GHDL backend: linking $$need -> $$real (sudo)"; \
-	 sudo ln -sf "$$real" "$$dir/$$need" && sudo ldconfig && \
-	   ghdl-llvm --version >/dev/null 2>&1 && echo ">> ghdl-llvm is now usable." \
-	   || echo ">> (could not fix ghdl-llvm; the scripts will use the mcode backend)"
+	 need=$$(ghdl-llvm --version 2>&1 | grep -oE 'libLLVM-[0-9]+\.so\.[0-9.]+' | head -1); \
+	 [ -n "$$need" ] || { echo ">> ghdl-llvm cannot load; the build will use the mcode backend."; exit 0; }; \
+	 ver=$$(echo "$$need" | sed -E 's/^libLLVM-([0-9]+).*/\1/'); \
+	 echo ">> ghdl-llvm needs $$need (LLVM $$ver) -- providing it (sudo may prompt) ..."; \
+	 if [ -n "$(APT)" ] && ! ls /usr/lib/llvm-$$ver/lib/libLLVM.so.* >/dev/null 2>&1 \
+	    && ! ls /usr/lib/*/libLLVM.so.$$ver.* >/dev/null 2>&1; then \
+	   sudo apt-get install -y libllvm$$ver >/dev/null 2>&1 || true; fi; \
+	 real=$$(ls /usr/lib/*/libLLVM.so.$$ver.* 2>/dev/null | head -1); \
+	 [ -n "$$real" ] || real=$$(ls /usr/lib/llvm-$$ver/lib/libLLVM.so.* 2>/dev/null | head -1); \
+	 tgt=/usr/lib/$$(uname -m)-linux-gnu; [ -d "$$tgt" ] || tgt=$$(dirname "$$real" 2>/dev/null); \
+	 if [ -n "$$real" ] && [ -n "$$tgt" ]; then \
+	   echo ">> linking $$tgt/$$need -> $$real (sudo)"; \
+	   sudo ln -sf "$$real" "$$tgt/$$need" && sudo ldconfig; fi; \
+	 ghdl-llvm --version >/dev/null 2>&1 && echo ">> ghdl-llvm is now usable (fast backend)." \
+	   || echo ">> LLVM backend still unavailable -- the build falls back to the mcode backend (self-contained; a bit slower)."
 
 # gcc: builds the teaching PC's terminal screen/keyboard (libpchost.so).
 check-gcc:

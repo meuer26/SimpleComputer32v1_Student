@@ -38,6 +38,8 @@ mkdir -p "$BUILD"
 if [ -z "${GHDL:-}" ]; then
     if command -v ghdl-llvm >/dev/null 2>&1 && ghdl-llvm --version >/dev/null 2>&1; then
         GHDL=ghdl-llvm
+    elif command -v ghdl-mcode >/dev/null 2>&1 && ghdl-mcode --version >/dev/null 2>&1; then
+        GHDL=ghdl-mcode          # LLVM backend missing/broken: mcode is self-contained
     else
         GHDL=ghdl
     fi
