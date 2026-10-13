@@ -35,14 +35,23 @@ mkdir -p "$BUILD"
 # silently picks mcode when both backends are installed, so select ghdl-llvm
 # explicitly when it is present AND loads (its shared lib can be missing). Set
 # GHDL=... to override.
+# Pick a backend that ACTUALLY RUNS (its --version succeeds), preferring the
+# fast LLVM one, then the self-contained mcode one (no LLVM dependency), then
+# gcc, then the generic wrapper. This never selects a backend whose shared
+# library is missing/broken. Set GHDL=... to force a specific one.
 if [ -z "${GHDL:-}" ]; then
-    if command -v ghdl-llvm >/dev/null 2>&1 && ghdl-llvm --version >/dev/null 2>&1; then
-        GHDL=ghdl-llvm
-    elif command -v ghdl-mcode >/dev/null 2>&1 && ghdl-mcode --version >/dev/null 2>&1; then
-        GHDL=ghdl-mcode          # LLVM backend missing/broken: mcode is self-contained
-    else
-        GHDL=ghdl
-    fi
+    for cand in ghdl-llvm ghdl-mcode ghdl-gcc ghdl; do
+        if command -v "$cand" >/dev/null 2>&1 && "$cand" --version >/dev/null 2>&1; then
+            GHDL="$cand"; break
+        fi
+    done
+fi
+if [ -z "${GHDL:-}" ] || ! command -v "$GHDL" >/dev/null 2>&1 || ! "$GHDL" --version >/dev/null 2>&1; then
+    echo "ERROR: no working GHDL backend found (the LLVM backend's shared library" >&2
+    echo "       may be missing). Install the self-contained mcode backend:" >&2
+    echo "           sudo apt install -y ghdl-mcode" >&2
+    echo "       then re-run.  (Or run 'make' to auto-install it.)" >&2
+    exit 1
 fi
 
 PROGRAM=""

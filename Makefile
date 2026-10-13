@@ -236,16 +236,20 @@ cpi-compare: check-gcc $(PCDISK)
 APT := $(shell command -v apt-get 2>/dev/null)
 
 # nasm + ghdl: assemble and simulate. Needed by every build/sim target.
-check-tools: check-llvm
+check-tools:
 	@missing=""; \
 	 command -v nasm >/dev/null 2>&1 || missing="$$missing nasm"; \
-	 command -v ghdl >/dev/null 2>&1 || missing="$$missing ghdl-llvm"; \
 	 command -v ghdl-mcode >/dev/null 2>&1 || missing="$$missing ghdl-mcode"; \
+	 command -v ghdl >/dev/null 2>&1 || missing="$$missing ghdl-llvm"; \
 	 if [ -n "$$missing" ]; then \
 	   [ -n "$(APT)" ] || { echo "ERROR: apt-get not found. Install$$missing manually, then re-run make."; exit 1; }; \
 	   echo ">> Installing:$$missing   (sudo may prompt for your password)"; \
 	   sudo apt-get update && sudo apt-get install -y $$missing || { echo "ERROR: could not install$$missing."; exit 1; }; \
 	 fi
+	@$(MAKE) --no-print-directory check-llvm     # enable the faster LLVM backend if possible
+	@if ghdl-mcode --version >/dev/null 2>&1 || ghdl-llvm --version >/dev/null 2>&1 || ghdl --version >/dev/null 2>&1; then :; else \
+	   echo "ERROR: no working GHDL backend. Install the self-contained one:"; \
+	   echo "           sudo apt install -y ghdl-mcode"; exit 1; fi
 
 # The scripts prefer the LLVM GHDL backend (faster; prints a VHDL backtrace on an
 # assertion). On Ubuntu the ghdl-llvm binary links the *versioned* LLVM soname
