@@ -35,22 +35,43 @@ mkdir -p "$BUILD"
 # silently picks mcode when both backends are installed, so select ghdl-llvm
 # explicitly when it is present AND loads (its shared lib can be missing). Set
 # GHDL=... to override.
-# Pick a backend that ACTUALLY RUNS (its --version succeeds), preferring the
-# fast LLVM one, then the self-contained mcode one (no LLVM dependency), then
-# gcc, then the generic wrapper. This never selects a backend whose shared
-# library is missing/broken. Set GHDL=... to force a specific one.
+# Pick a backend that can ACTUALLY COMPILE, preferring the fast LLVM one, then
+# the self-contained mcode one (no LLVM dependency), then gcc, then the generic
+# wrapper. CRITICAL: `ghdl-llvm --version` succeeds even when its shared library
+# (libLLVM-NN.so) is missing/mismatched -- the driver only execs the LLVM code
+# generator during real analysis/elaboration, so the breakage surfaces there,
+# not at --version. We therefore probe each backend by actually analyzing AND
+# elaborating a trivial design; this never selects a backend that would die
+# mid-build (e.g. Pop!_OS 24.04's libLLVM-18.so soname mismatch). Set GHDL=...
+# to force a specific backend. The winning backend is cached in build/ so the
+# probe runs only once per clean tree.
+ghdl_backend_works() {
+    command -v "$1" >/dev/null 2>&1 || return 1
+    _gp="$(mktemp -d 2>/dev/null)" || return 1
+    printf 'entity ghdl_probe is end;\narchitecture a of ghdl_probe is begin end;\n' \
+        > "$_gp/ghdl_probe.vhdl"
+    ( cd "$_gp" && "$1" -a --std="$STD" ghdl_probe.vhdl \
+                && "$1" -e --std="$STD" ghdl_probe ) >/dev/null 2>&1
+    _rc=$?; rm -rf "$_gp"; return $_rc
+}
+BACKEND_CACHE="$BUILD/.ghdl_backend"
+if [ -z "${GHDL:-}" ] && [ -s "$BACKEND_CACHE" ]; then
+    _c="$(cat "$BACKEND_CACHE" 2>/dev/null)"
+    command -v "$_c" >/dev/null 2>&1 && GHDL="$_c"
+fi
 if [ -z "${GHDL:-}" ]; then
     for cand in ghdl-llvm ghdl-mcode ghdl-gcc ghdl; do
-        if command -v "$cand" >/dev/null 2>&1 && "$cand" --version >/dev/null 2>&1; then
-            GHDL="$cand"; break
+        if ghdl_backend_works "$cand"; then
+            GHDL="$cand"; echo "$cand" > "$BACKEND_CACHE" 2>/dev/null; break
         fi
     done
 fi
-if [ -z "${GHDL:-}" ] || ! command -v "$GHDL" >/dev/null 2>&1 || ! "$GHDL" --version >/dev/null 2>&1; then
+if [ -z "${GHDL:-}" ]; then
     echo "ERROR: no working GHDL backend found (the LLVM backend's shared library" >&2
-    echo "       may be missing). Install the self-contained mcode backend:" >&2
+    echo "       may be missing/mismatched, e.g. libLLVM-18.so on Pop!_OS 24.04)." >&2
+    echo "       Install the self-contained mcode backend -- it has no LLVM dep:" >&2
     echo "           sudo apt install -y ghdl-mcode" >&2
-    echo "       then re-run.  (Or run 'make' to auto-install it.)" >&2
+    echo "       then re-run.  (Plain 'make' auto-installs and uses it.)" >&2
     exit 1
 fi
 
